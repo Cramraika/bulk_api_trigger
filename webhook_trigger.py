@@ -559,7 +559,8 @@ def read_multiple_csv_files(file_patterns: List[str] = None, chunk_size: int = 1
             'http_triggers*.csv',
             'webhooks*.csv',
             'apis*.csv',
-            '*.csv'
+            '*.csv',
+            '**/*.csv'  # Recursive search for all CSV files
         ]
     
     found_files = []
