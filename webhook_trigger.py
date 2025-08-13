@@ -722,19 +722,24 @@ class BulkAPITrigger:
             # Generate summary
             job_stats = self.db_manager.get_job_stats(job_id)
             success_rate = (successful_count / total_requests) * 100 if total_requests > 0 else 0
-            
+
+            BOX_WIDTH = 70  # Total width of the box (including borders)
+            # Calculate padding for the success rate line
+            success_rate_str = f"{success_rate:.2f}%"
+            label = "📊 Success Rate: "
+            pad_length = BOX_WIDTH - 4 - len(label) - len(success_rate_str)  # 4 for borders and spaces
             logger.info(f"""
-╔══════════════════════════════════════════════════════════════════════╗
-║                           🎯 JOB COMPLETED                           ║
-╠══════════════════════════════════════════════════════════════════════╣
-║ Job Name: {job_name:<56} ║
-║ Job ID: {job_id:<58} ║
-║ Total Requests: {total_requests:<49} ║
-║ ✅ Successful: {successful_count:<50} ║
-║ ❌ Failed: {failed_count:<54} ║
-║ 📊 Success Rate: {success_rate:.2f}%{' ' * (46 - len(f'{success_rate:.2f}%'))} ║
-║ ⏱️  Duration: {job_stats.get('duration_seconds', 0):.2f} seconds{' ' * (43 - len(f'{job_stats.get("duration_seconds", 0):.2f} seconds'))} ║
-╚══════════════════════════════════════════════════════════════════════╝
+╔{'═' * (BOX_WIDTH - 2)}╗
+║{' ' * ((BOX_WIDTH - 2 - len('🎯 JOB COMPLETED')) // 2)}🎯 JOB COMPLETED{' ' * ((BOX_WIDTH - 2 - len('🎯 JOB COMPLETED') + 1) // 2)}║
+╠{'═' * (BOX_WIDTH - 2)}╣
+║ Job Name: {job_name:<{BOX_WIDTH - 15}}║
+║ Job ID: {job_id:<{BOX_WIDTH - 13}}║
+║ Total Requests: {total_requests:<{BOX_WIDTH - 20}}║
+║ ✅ Successful: {successful_count:<{BOX_WIDTH - 18}}║
+║ ❌ Failed: {failed_count:<{BOX_WIDTH - 14}}║
+║ {label}{success_rate_str}{' ' * pad_length}║
+║ ⏱️  Duration: {job_stats.get('duration_seconds', 0):.2f} seconds{' ' * (BOX_WIDTH - 19 - len(f'{job_stats.get("duration_seconds", 0):.2f} seconds'))}║
+╚{'═' * (BOX_WIDTH - 2)}╝
             """)
             
             # Send notifications
