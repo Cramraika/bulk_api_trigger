@@ -1,0 +1,66 @@
+# Bulk API Trigger Configuration
+# ================================
+
+# Rate limiting and performance settings
+rate_limiting:
+  base_rate_limit: 2.0        # Minimum delay between requests (seconds)
+  starting_rate_limit: 2.0    # Initial delay
+  max_rate_limit: 10.0        # Maximum delay when errors occur
+  window_size: 20             # Number of requests to analyze for rate adjustment
+  error_threshold: 0.3        # Error rate threshold (30%)
+  max_workers: 5              # Maximum parallel requests
+
+# Retry and timeout settings
+retry:
+  max_retries: 3              # Number of retries per failed request
+  retry_delay: 1.0            # Delay between retries (seconds)
+  timeout: 30                 # Request timeout (seconds)
+
+# Notification settings
+notifications:
+  email:
+    enabled: false
+    smtp_server: smtp.gmail.com
+    smtp_port: 587
+    username: your_email@gmail.com
+    password: your_app_password  # Use app password for Gmail
+    from_email: your_email@gmail.com
+    recipients:
+      - admin@example.com
+      - team@example.com
+    notify_on_completion: true
+    notify_on_errors: true
+
+  slack:
+    enabled: false
+    webhook_url: https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+    notify_on_completion: true
+    notify_on_errors: true
+
+# Database settings
+database:
+  enabled: true
+  path: webhook_results.db
+
+# CSV processing settings
+csv:
+  required_columns:
+    - webhook_url
+  optional_columns:
+    - method
+    - payload
+    - header
+    - name
+    - group
+  chunk_size: 1000
+  file_patterns:
+    - "http_triggers*.csv"
+    - "webhooks*.csv"
+    - "apis*.csv"
+    - "*.csv"
+
+# Deployment settings
+deployment:
+  keep_alive: true            # Keep container running after completion
+  log_level: INFO             # Logging level
+  max_log_size_mb: 100        # Maximum log file size

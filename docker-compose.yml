@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  bulk-api-trigger:
+    build: .
+    container_name: bulk-api-trigger
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./csv:/app/csv
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      # Deployment Settings
+      - DEPLOYMENT_MODE=true
+      - KEEP_ALIVE=true
+      - JOB_NAME=Docker Bulk API Job
+      
+      # Rate Limiting
+      - MAX_WORKERS=5
+      - BASE_RATE_LIMIT=2.0
+      - STARTING_RATE_LIMIT=2.0
+      - MAX_RATE_LIMIT=10.0
+      - ERROR_THRESHOLD=0.3
+      - WINDOW_SIZE=20
+      
+      # Request Settings
+      - MAX_RETRIES=3
+      - REQUEST_TIMEOUT=30
+      - SKIP_ROWS=0
+      
+      # Database
+      - DATABASE_ENABLED=true
+      - DATABASE_PATH=/app/data/webhook_results.db
+      
+      # Notifications (uncomment and configure as needed)
+      # - EMAIL_NOTIFICATIONS=true
+      # - EMAIL_SMTP_SERVER=smtp.gmail.com
+      # - EMAIL_SMTP_PORT=587
+      # - EMAIL_USERNAME=your_email@gmail.com
+      # - EMAIL_PASSWORD=your_app_password
+      # - EMAIL_FROM=your_email@gmail.com
+      # - EMAIL_RECIPIENTS=admin@example.com,team@example.com
+      
+      # - SLACK_NOTIFICATIONS=true
+      # - SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlite3; conn=sqlite3.connect('/app/data/webhook_results.db'); conn.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Web dashboard for monitoring (future enhancement)
+  # dashboard:
+  #   image: nginx:alpine
+  #   ports:
+  #     - "8080:80"
+  #   volumes:
+  #     - ./dashboard:/usr/share/nginx/html:ro
+  #   depends_on:
+  #     - bulk-api-trigger
+
+volumes:
+  data:
+  logs:
