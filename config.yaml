@@ -54,9 +54,7 @@ csv:
     - group
   chunk_size: 1000
   file_patterns:
-    - "http_triggers*.csv"
-    - "webhooks*.csv"
-    - "apis*.csv"
+    - "**/*.csv"
     - "*.csv"
 
 # Deployment settings
