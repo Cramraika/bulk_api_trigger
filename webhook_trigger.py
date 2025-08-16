@@ -506,8 +506,23 @@ class FileWatchdog(FileSystemEventHandler):
 
                 # Already completed with same hash?
                 if self.db_manager.is_file_processed(file_path, file_hash):
-                    logger.info(f"File {file_path} already processed, skipping")
+                    logger.info(f"⏭️  Duplicate content detected for {os.path.basename(file_path)} (hash match).")
+                    dup_dir = self.config.get('csv', {}).get('duplicates_path', '')
+                    moved = move_file_reasoned(file_path, dup_dir, reason_prefix="dup_")
+                    if moved:
+                        # Optionally record status change
+                        try:
+                            self.db_manager.update_file_status(file_path, 'skipped_duplicate')
+                        except Exception:
+                            pass
                     return
+                
+                # Missing webhook URL?
+                if 'webhook_url' not in headers:
+                    logger.warning(f"File {file_path} missing required 'webhook_url' column")
+                    rej_dir = self.config.get('csv', {}).get('rejected_path', '')
+                    move_file_reasoned(file_path, rej_dir, reason_prefix="invalid_")
+                    return False
 
                 # Already queued/processing in DB?
                 status = self.db_manager.get_file_status(file_path)
@@ -1254,7 +1269,22 @@ def archive_processed_file(file_path: str, config: Dict) -> bool:
     except Exception as e:
         logger.error(f"❌ Error archiving file {file_path}: {e}")
         return False
-
+    
+def move_file_reasoned(file_path: str, target_dir: str, reason_prefix: str = "") -> bool:
+    try:
+        if not target_dir:
+            return False  # path not configured
+        os.makedirs(target_dir, exist_ok=True)
+        filename = os.path.basename(file_path)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        new_name = f"{ts}_{reason_prefix}{filename}" if reason_prefix else f"{ts}_{filename}"
+        shutil.move(file_path, os.path.join(target_dir, new_name))
+        logger.info(f"📦 Moved file: {filename} -> {new_name} [{reason_prefix.rstrip('_')}]")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to move {file_path} to {target_dir}: {e}")
+        return False
+    
 class BulkAPITrigger:
     def __init__(self, config: Dict):
         self.config = config
@@ -1875,7 +1905,7 @@ def scan_existing_files(trigger: BulkAPITrigger):
                     'detected_at': datetime.now().isoformat()
                 }
                 
-                trigger.db_manager.track_file(csv_file, file_hash, file_stats.st_size, row_count=0)
+                trigger.db_manager.track_file(csv_file, file_hash, file_stats.st_size, rows_count=0)
                 trigger.db_manager.update_file_status(csv_file, 'queued')
 
                 with trigger.inflight_lock:

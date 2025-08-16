@@ -25,6 +25,8 @@ RUN mkdir -p /app/data \
     /app/data/logs \
     /app/data/csv \
     /app/data/csv/processed \
+    /app/data/csv/duplicates \
+    /app/data/csv/rejected \
     /app/data/backups
 
 # Set proper permissions
