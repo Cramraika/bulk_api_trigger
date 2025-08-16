@@ -31,6 +31,12 @@ from contextlib import contextmanager
 # Configure logging with rotation
 from logging.handlers import RotatingFileHandler
 
+def _to_float(v, default=0.0):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
 def setup_logging():
     """Setup enhanced logging with rotation"""
     log_formatter = logging.Formatter(
@@ -285,12 +291,6 @@ class DatabaseManager:
             ''', (status, job_id, file_path))
             
             conn.commit()
-    
-    def _to_float(v, default=0.0):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return default
 
     def get_job_stats(self, job_id: str) -> Dict:
         """Get comprehensive job statistics (robust against NULL/TEXT values)."""
