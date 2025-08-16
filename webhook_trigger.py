@@ -65,15 +65,21 @@ logger = setup_logging()
 class DatabaseManager:
     def __init__(self, db_path='/app/data/webhook_results.db'):
         self.db_path = db_path
-        self.init_database()
+        # ensure parent directory exists
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        # create the lock BEFORE any connection usage
         self._connection_lock = Lock()
+        self.init_database()
     
     @contextmanager
     def get_connection(self):
         """Thread-safe database connection context manager"""
         with self._connection_lock:
-            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
             try:
+                # optional: better concurrency
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
                 yield conn
             finally:
                 conn.close()
