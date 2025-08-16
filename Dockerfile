@@ -48,10 +48,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD curl -f http://localhost:8000/health || python -c "import sqlite3; conn=sqlite3.connect('/app/data/webhook_results.db'); conn.close()" || exit 1
 
-# Create a non-root user for security
-RUN useradd --create-home --shell /bin/bash app && \
-    chown -R app:app /app
-USER app
-
 # Run the application
 CMD ["python", "webhook_trigger.py"]
