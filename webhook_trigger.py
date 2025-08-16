@@ -34,31 +34,67 @@ from logging.handlers import RotatingFileHandler
 
 # ---------- Logging ----------
 def setup_logging():
-    """Setup enhanced logging with rotation"""
-    log_formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - [%(threadName)s] - %(message)s'
-    )
-    os.makedirs('/app/data/logs', exist_ok=True)
-    file_handler = RotatingFileHandler(
-        '/app/data/logs/webhook_trigger.log',
-        maxBytes=100*1024*1024,  # 100MB
-        backupCount=5
-    )
-    max_mb = int(os.getenv('MAX_LOG_SIZE_MB', '100'))
-    file_handler = RotatingFileHandler(
-    '/app/data/logs/webhook_trigger.log',
-    maxBytes=max_mb * 1024 * 1024,
-    backupCount=5
-    )
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(log_formatter)
+    """Setup enhanced logging with rotation (robust, UTF-8, single-init, flush on exit)."""
+    import atexit
+    from logging.handlers import RotatingFileHandler
+
+    # Avoid duplicate handlers if setup_logging() is ever called twice.
+    root_logger = logging.getLogger()
+    if getattr(root_logger, "_already_configured", False):
+        return logging.getLogger(__name__)
+
+    # Read level early
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    root_logger = logging.getLogger()
+
+    # Ensure directories exist and are writable
+    log_dir = '/app/data/logs'
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, 'webhook_trigger.log')
+
+    # Formatter: include thread and time
+    log_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - [%(threadName)s] - %(name)s - %(message)s'
+    )
+
+    # File handler with rotation — UTF-8, explicit size from env if present
+    max_mb = int(os.getenv('MAX_LOG_SIZE_MB', '100'))
+    file_handler = RotatingFileHandler(
+        log_path,
+        maxBytes=max_mb * 1024 * 1024,
+        backupCount=5,
+        encoding='utf-8',   # important for emoji
+        delay=False
+    )
+    file_handler.setFormatter(log_formatter)
+    file_handler.setLevel(level)
+
+    # Console handler to stdout
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(log_formatter)
+    console_handler.setLevel(level)
+
+    # Reset root handlers and apply exactly ours
+    root_logger.handlers.clear()
     root_logger.setLevel(level)
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
-    return logging.getLogger(__name__)
+
+    # Mark configured to avoid re-adding on imports
+    root_logger._already_configured = True
+
+    # Flush everything on exit (and on SIGTERM/INT via your signal handler)
+    def _flush_handlers():
+        for h in list(root_logger.handlers):
+            try:
+                h.flush()
+            except Exception:
+                pass
+    atexit.register(_flush_handlers)
+
+    lg = logging.getLogger(__name__)
+    lg.debug("Logging initialized (level=%s, path=%s, max_mb=%d)", level_name, log_path, max_mb)
+    return lg
 
 logger = setup_logging()
 
@@ -74,6 +110,40 @@ def _to_float(v, default=0.0):
         return float(v)
     except (TypeError, ValueError):
         return default
+
+def _count_csv_rows(file_path: str) -> int:
+    """Count non-header rows (with any value in webhook_url), respecting encoding/delimiter."""
+    try:
+        enc = _detect_encoding(file_path)
+        with open(file_path, 'r', encoding=enc, newline='') as f:
+            delim = _detect_delimiter(f)
+            reader = csv.DictReader(f, delimiter=delim)
+            raw_headers = reader.fieldnames or []
+            headers = _normalize_headers(raw_headers)
+            if 'webhook_url' not in headers:
+                return 0
+            name_map = {orig: norm for orig, norm in zip(raw_headers, headers)}
+            count = 0
+            for row in reader:
+                nrow = {name_map.get(k, (k or '')).lower(): (v or '').strip() for k, v in row.items()}
+                if nrow.get('webhook_url'):
+                    count += 1
+            return count
+    except Exception:
+        return 0
+
+def _slack_urgency_for_progress(successful_count: int, processed_count: int) -> str:
+    """Pick a Slack urgency based on live success rate."""
+    if processed_count <= 0:
+        return "normal"
+    rate = successful_count / processed_count
+    if rate >= 0.98:
+        return "low"
+    if rate >= 0.90:
+        return "normal"
+    if rate >= 0.80:
+        return "high"
+    return "critical"
 
 def _detect_encoding(csv_path: str) -> str:
     """Detect CSV file encoding"""
@@ -1161,32 +1231,16 @@ class BulkAPITrigger:
                             error_window.append(error)
                             if len(error_window) > rate_config.get('window_size', 20):
                                 error_window.pop(0)
+
                             processed_count += 1
+
+                            # Update success/failure counters
                             if error == 0:
                                 successful_count += 1
-                                try:
-                                    if (
-                                        self.notification_manager.slack_config.get('enabled')
-                                        and os.getenv("SLACK_NOTIFY_PROGRESS", "false").lower() == "true"
-                                        and processed_count % int(os.getenv("SLACK_PROGRESS_EVERY_N", "25")) == 0
-                                    ):
-                                        urgency = os.getenv("SLACK_PROGRESS_URGENCY", "auto")
-                                        if urgency == "auto":
-                                            urgency = _slack_urgency_for_progress(successful_count, processed_count)
-                                        self.notification_manager.send_slack_notification(
-                                            (
-                                                f"⏳ *{job_name}* in progress\n"
-                                                f"{processed_count}/{total_requests} processed\n"
-                                                f"✅ {successful_count} success | ❌ {failed_count} failed\n"
-                                                f"~{(processed_count/total_requests*100):.1f}% done"
-                                            ),
-                                            urgency
-                                        )
-                                except Exception:
-                                    pass
                             else:
                                 failed_count += 1
 
+                            # -------- Logger progress every PROGRESS_EVERY_N --------
                             PROGRESS_EVERY_N = int(os.getenv("PROGRESS_EVERY_N", "50"))
                             if processed_count % PROGRESS_EVERY_N == 0:
                                 success_rate = (successful_count / processed_count) * 100
@@ -1196,26 +1250,51 @@ class BulkAPITrigger:
                                     f"({success_rate:.1f}% success, {throughput:.2f} req/s)"
                                 )
 
+                            # -------- Slack progress: independent of success/failure --------
+                            if (
+                                self.notification_manager.slack_config.get('enabled')
+                                and os.getenv("SLACK_NOTIFY_PROGRESS", "false").lower() == "true"
+                            ):
+                                every_n = int(os.getenv("SLACK_PROGRESS_EVERY_N", "25"))
+                                # fire on cadence, and also on the very first processed item (optional)
+                                if processed_count % every_n == 0 or processed_count == 1:
+                                    urgency = os.getenv("SLACK_PROGRESS_URGENCY", "auto")
+                                    if urgency == "auto":
+                                        urgency = _slack_urgency_for_progress(successful_count, processed_count)
+
+                                    msg = (
+                                        f"⏳ *{job_name}* in progress\n"
+                                        f"{processed_count}/{total_requests} processed\n"
+                                        f"✅ {successful_count} success | ❌ {failed_count} failed\n"
+                                        f"~{(processed_count/total_requests*100):.1f}% done"
+                                    )
+                                    try:
+                                        self.notification_manager.send_slack_notification(msg, urgency)
+                                    except Exception as _e:
+                                        # keep running even if Slack chokes
+                                        logger.debug(f"Progress Slack suppressed: {type(_e).__name__}: {_e}")
+
                         except Exception as e:
                             webhook = futures[future]
                             logger.error(f"💥 Failed processing {webhook['url']}: {e}")
                             failed_count += 1
                             processed_count += 1
 
-                        # Dynamic rate adjustment (fix: reduce on errors, increase on low errors)
+                        # -------- Dynamic rate adjustment (your fixed direction) --------
                         if processed_count % rate_config.get('window_size', 20) == 0 and error_window:
                             error_rate = sum(error_window) / len(error_window)
                             current_rate = rate_limiter.get_rate()
                             if error_rate > rate_config.get('error_threshold', 0.3):
                                 # too many errors -> slow down
                                 new_rate = max(self.config.get('rate_limiting', {}).get('base_rate_limit', 3.0),
-                                               current_rate / 1.2)
+                                            current_rate / 1.2)
                                 rate_limiter.adjust_rate(new_rate)
                             elif error_rate < rate_config.get('error_threshold', 0.3) / 2:
                                 # healthy -> speed up (but cap)
                                 new_rate = min(self.config.get('rate_limiting', {}).get('max_rate_limit', 5.0),
-                                               current_rate * 1.2)
+                                            current_rate * 1.2)
                                 rate_limiter.adjust_rate(new_rate)
+
 
             # Finalize job
             self.db_manager.finish_job(job_id, successful_count, failed_count)
@@ -1255,6 +1334,36 @@ class BulkAPITrigger:
                 self.db_manager.save_metric('job_success_rate', success_rate)
                 self.db_manager.save_metric('job_duration', job_stats.get('duration_seconds', 0))
                 self.db_manager.save_metric('job_throughput', metrics['throughput'])
+                # --- NEW: Always write a JSON job report to disk ---
+                try:
+                    report_path = write_job_json_report(
+                        db_manager=self.db_manager,
+                        job_id=job_id,
+                        job_name=job_name,
+                        csv_file_path=csv_file_path,
+                        total_requests=total_requests,
+                        successful_count=successful_count,
+                        failed_count=failed_count,
+                        metrics=metrics,
+                        extra_stats=stats,  # includes combined file stats in multi-file mode
+                    )
+                    logger.info(f"📝 Job report written: {report_path}")
+                    
+                    # Optional: ping Slack with a summary + path (no file upload, just a link/path)
+                    if (
+                        self.notification_manager.slack_config.get('enabled')
+                        and os.getenv("SLACK_NOTIFY_COMPLETION", "true").lower() == "true"
+                    ):
+                        try:
+                            self.notification_manager.send_slack_notification(
+                                f"📝 Job *{job_name}* report saved:\n{report_path}",
+                                'low'
+                            )
+                        except Exception:
+                            pass
+                except Exception as _e:
+                    logger.error(f"Failed to write job JSON report: {_e}")
+
 
             return job_id
 
@@ -1312,6 +1421,11 @@ class BulkAPITrigger:
                     if self.db_manager.is_file_processed(job_info['csv_file'], job_info['file_hash']):
                         logger.info(f"File already processed: {os.path.basename(job_info['csv_file'])}")
                         continue
+                    if not job_info.get('row_count'):
+                        try:
+                            job_info['row_count'] = _count_csv_rows(job_info['csv_file'])
+                        except Exception:
+                            pass
                     self.notification_manager.send_file_detected_notification(job_info)
                     job_name = f"{os.path.basename(job_info['csv_file'])}"
                     logger.info(f"🎬 Auto-processing file: {os.path.basename(job_info['csv_file'])}")
@@ -1517,6 +1631,117 @@ def backup_database(db_manager: DatabaseManager):
         logger.info(f"💾 Database backup created: {os.path.basename(backup_path)}")
     except Exception as e:
         logger.error(f"Database backup failed: {e}")
+
+def write_job_json_report(
+    db_manager: "DatabaseManager",
+    job_id: str,
+    job_name: str,
+    csv_file_path: str,
+    total_requests: int,
+    successful_count: int,
+    failed_count: int,
+    metrics: Dict,
+    extra_stats: Dict = None,
+    out_dir: str = "/app/data/reports",
+) -> str:
+    """
+    Generate a JSON report for the completed job and write it to disk.
+    Returns the absolute path to the written JSON file.
+    """
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception as e:
+        try:
+            # fallback: put it under /app/data if reports fails
+            out_dir = "/app/data"
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            # last resort: current dir
+            out_dir = "."
+    
+    # Pull fresh stats from DB
+    try:
+        job_stats = db_manager.get_job_stats(job_id) or {}
+    except Exception:
+        job_stats = {}
+    
+    # Build status breakdown straight from DB (again) for completeness
+    status_breakdown = job_stats.get("status_breakdown", {})
+    
+    # Collect a small sample of errors to help debugging without bloating the file
+    error_samples = []
+    try:
+        with db_manager.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT url, method, status, status_code, error_message, timestamp
+                FROM webhook_results
+                WHERE job_id = ?
+                  AND (status = 'error' OR status = 'exception')
+                ORDER BY timestamp DESC
+                LIMIT 50
+                """,
+                (job_id,),
+            )
+            rows = cur.fetchall()
+            for r in rows:
+                error_samples.append({
+                    "url": r[0],
+                    "method": r[1],
+                    "status": r[2],
+                    "status_code": r[3],
+                    "error_message": r[4],
+                    "timestamp": r[5],
+                })
+    except Exception:
+        pass
+    
+    # Compose report
+    report = {
+        "job": {
+            "id": job_id,
+            "name": job_name,
+            "csv_file": csv_file_path,
+            "start_time": job_stats.get("start_time"),
+            "end_time": job_stats.get("end_time"),
+            "duration_seconds": job_stats.get("duration_seconds", 0.0),
+            "triggered_by": job_stats.get("triggered_by", "manual"),
+        },
+        "totals": {
+            "total_requests": total_requests,
+            "successful": successful_count,
+            "failed": failed_count,
+            "success_rate": (successful_count / total_requests * 100.0) if total_requests else 0.0,
+        },
+        "performance": {
+            "average_response_time": job_stats.get("average_response_time", 0.0),
+            "status_breakdown": status_breakdown,
+            "metrics": metrics or {},  # throughput, bytes if your tracker provides them
+        },
+        "data": {
+            "extra_stats": extra_stats or {},   # e.g., combined CSV stats from multi-file
+        },
+        "errors_sample": error_samples,
+        "generated_at": datetime.now().isoformat(),
+        "version": 1,
+    }
+    
+    # Stable filename based on job id
+    safe_job_id = job_id.replace("/", "_").replace("\\", "_")
+    out_path = os.path.join(out_dir, f"job_{safe_job_id}.json")
+    
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        # fallback: write to /app/data with a timestamped name
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join("/app/data", f"job_{safe_job_id}_{ts}.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+    
+    return out_path
 
 
 def scan_existing_files(trigger: BulkAPITrigger):
