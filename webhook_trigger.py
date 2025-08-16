@@ -31,12 +31,6 @@ from contextlib import contextmanager
 # Configure logging with rotation
 from logging.handlers import RotatingFileHandler
 
-def _to_float(v, default=0.0):
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
-
 def setup_logging():
     """Setup enhanced logging with rotation"""
     log_formatter = logging.Formatter(
@@ -292,46 +286,80 @@ class DatabaseManager:
             
             conn.commit()
     
+    def _to_float(v, default=0.0):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
     def get_job_stats(self, job_id: str) -> Dict:
-        """Get comprehensive job statistics"""
+        """Get comprehensive job statistics (robust against NULL/TEXT values)."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            
+
+            # Defaults so we never hit NameError
+            job = None
+            duration = 0.0
+            avg_response_time = 0.0
+            status_stats = {}
+
+            # Fetch job row
             cursor.execute('SELECT * FROM job_history WHERE job_id = ?', (job_id,))
             job = cursor.fetchone()
-            
+
+            # Status breakdown
             cursor.execute('''
                 SELECT status, COUNT(*), AVG(response_time), MIN(response_time), MAX(response_time)
                 FROM webhook_results 
                 WHERE job_id = ? 
                 GROUP BY status
             ''', (job_id,))
-            
-            status_stats = {}
             for row in cursor.fetchall():
                 status_stats[row[0]] = {
-                    'count': row[1],
-                    'avg_response_time': _to_float(job[2], 0.0),
-                    'min_response_time': _to_float(job[3], 0.0),
-                    'max_response_time': _to_float(job[4], 0.0)
+                    'count': row[1] or 0,
+                    'avg_response_time': _to_float(row[2], 0.0),
+                    'min_response_time': _to_float(row[3], 0.0),
+                    'max_response_time': _to_float(row[4], 0.0)
                 }
-            
-            if job:
+
+            if not job:
+                # No row yet (should be rare). Return minimal stats.
                 return {
-                    'job_id': job[0],
-                    'job_name': job[1],
-                    'csv_file': job[2],
-                    'total_requests': _to_float(job[3], 0.0),
-                    'successful_requests': _to_float(job[4], 0.0),
-                    'failed_requests': _to_float(job[5], 0.0),
-                    'start_time': job[6],
-                    'end_time': job[7],
-                    'duration_seconds': duration,
-                    'triggered_by': job[10],
-                    'average_response_time': avg_rt,
-                    'status_breakdown': status_stats
+                    'job_id': job_id,
+                    'job_name': '',
+                    'csv_file': '',
+                    'total_requests': 0,
+                    'successful_requests': 0,
+                    'failed_requests': 0,
+                    'start_time': '',
+                    'end_time': '',
+                    'duration_seconds': 0.0,
+                    'triggered_by': 'manual',
+                    'average_response_time': 0.0,
+                    'status_breakdown': status_stats,
                 }
-        return {}
+
+            # Map columns by index from your CREATE TABLE order
+            # job = (job_id, job_name, csv_file, total_requests, successful_requests, failed_requests,
+            #        start_time, end_time, duration_seconds, config, status, triggered_by, average_response_time, created_at)
+            duration = _to_float(job[8], 0.0)
+            avg_response_time = _to_float(job[12], 0.0) if len(job) > 12 else 0.0
+
+            return {
+                'job_id': job[0],
+                'job_name': job[1],
+                'csv_file': job[2],
+                'total_requests': int(_to_float(job[3], 0.0)),
+                'successful_requests': int(_to_float(job[4], 0.0)),
+                'failed_requests': int(_to_float(job[5], 0.0)),
+                'start_time': job[6],
+                'end_time': job[7],
+                'duration_seconds': duration,
+                'triggered_by': job[11] if len(job) > 11 else 'manual',
+                'average_response_time': avg_response_time,
+                'status_breakdown': status_stats
+            }
+
     
     def save_metric(self, metric_name: str, metric_value: float):
         """Save system metrics"""
