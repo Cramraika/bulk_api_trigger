@@ -292,6 +292,15 @@ class DatabaseManager:
             
             conn.commit()
 
+    def get_file_status(self, file_path: str) -> Optional[str]:
+        """Return current file_tracking.status for a file (or None if not tracked)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute('SELECT status FROM file_tracking WHERE file_path = ?', (file_path,))
+            row = cursor.fetchone()
+            return row[0] if row else None
+    
     def get_job_stats(self, job_id: str) -> Dict:
         """Get comprehensive job statistics (robust against NULL/TEXT values)."""
         with self.get_connection() as conn:
@@ -373,17 +382,18 @@ class DatabaseManager:
 
 class FileWatchdog(FileSystemEventHandler):
     """Enhanced file system watchdog for CSV monitoring"""
-    
-    def __init__(self, job_queue: queue.Queue, db_manager: DatabaseManager, config: Dict):
+    def __init__(self, job_queue: queue.Queue, db_manager: DatabaseManager, config: Dict,
+                 inflight_files: Set[str], inflight_lock: Lock):
         super().__init__()
         self.job_queue = job_queue
         self.db_manager = db_manager
         self.config = config
-        self.processed_files: Set[str] = set()
+        self.inflight_files = inflight_files
+        self.inflight_lock = inflight_lock
         self.file_lock = Lock()
-        
-        # Load existing processed files
+        self.processed_files: Set[str] = set()  # (optional legacy; no longer used to dedupe)
         self._load_processed_files()
+
         
     def _load_processed_files(self):
         """Load previously processed files from database"""
@@ -474,38 +484,47 @@ class FileWatchdog(FileSystemEventHandler):
         """Handle file system events with duplicate checking"""
         try:
             with self.file_lock:
-                # Normalize path
                 file_path = os.path.abspath(file_path)
-                
-                # Check if it's a valid CSV file
+
+                # Validate CSV and stable size
                 if not self._is_valid_csv_file(file_path):
                     return
-                
-                # Calculate file hash
+
+                # Hash
                 file_hash = self._calculate_file_hash(file_path)
                 if not file_hash:
                     return
-                
-                # Check if already processed
+
+                # Already completed with same hash?
                 if self.db_manager.is_file_processed(file_path, file_hash):
                     logger.info(f"File {file_path} already processed, skipping")
                     return
-                
-                # Get file stats
+
+                # Already queued/processing in DB?
+                status = self.db_manager.get_file_status(file_path)
+                if status in ('queued', 'processing'):
+                    logger.debug(f"Already {status} (DB): {file_path} — event {event_type} ignored")
+                    return
+
+                # In-memory short-circuit?
+                with self.inflight_lock:
+                    if file_path in self.inflight_files:
+                        logger.debug(f"Already pending (in-memory): {file_path} — event {event_type} ignored")
+                        return
+
+                # Get file stats + rows
                 file_stats = os.stat(file_path)
                 file_size = file_stats.st_size
-                
-                # Count rows
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
-                        row_count = sum(1 for _ in csv.reader(f)) - 1  # Subtract header
-                except:
+                        row_count = max(sum(1 for _ in csv.reader(f)) - 1, 0)
+                except Exception:
                     row_count = 0
-                
-                # Track file in database
+
+                # Track + set status=queued
                 self.db_manager.track_file(file_path, file_hash, file_size, row_count)
-                
-                # Create job info
+                self.db_manager.update_file_status(file_path, 'queued')
+
                 job_info = {
                     'csv_file': file_path,
                     'file_hash': file_hash,
@@ -514,138 +533,198 @@ class FileWatchdog(FileSystemEventHandler):
                     'event_type': event_type,
                     'detected_at': datetime.now().isoformat()
                 }
-                
-                # Add to job queue
+
+                # Mark inflight and enqueue
+                with self.inflight_lock:
+                    self.inflight_files.add(file_path)
+
                 self.job_queue.put(job_info)
-                self.processed_files.add(file_path)
-                
                 logger.info(f"🆕 New CSV file detected: {os.path.basename(file_path)} "
-                          f"({row_count} rows, {file_size} bytes) via {event_type}")
-                
+                            f"({row_count} rows, {file_size} bytes) via {event_type}")
+
         except Exception as e:
             logger.error(f"Error handling file event for {file_path}: {e}")
             logger.error(traceback.format_exc())
+
 
 class NotificationManager:
     def __init__(self, config: Dict):
         self.config = config
         self.email_config = config.get('email', {})
-        self.webhook_config = config.get('webhook', {})
         self.slack_config = config.get('slack', {})
-    
+
     def send_email_notification(self, subject: str, body: str, to_emails: List[str]):
-        """Send email notification with enhanced error handling"""
         if not self.email_config.get('enabled', False):
             return
-        
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 msg = MIMEMultipart()
-                msg['From'] = self.email_config['from_email']
+                msg['From'] = self.email_config.get('from_email', '')
                 msg['To'] = ', '.join(to_emails)
                 msg['Subject'] = subject
-                
                 msg.attach(MIMEText(body, 'html'))
-                
-                server = smtplib.SMTP(self.email_config['smtp_server'], self.email_config['smtp_port'])
-                server.starttls()
-                server.login(self.email_config['username'], self.email_config['password'])
+
+                smtp_port = int(self.email_config.get('smtp_port', 587))
+                smtp_server = self.email_config.get('smtp_server', 'smtp.gmail.com')
+                use_ssl = smtp_port == 465
+                if use_ssl:
+                    server = smtplib.SMTP_SSL(smtp_server, smtp_port)
+                else:
+                    server = smtplib.SMTP(smtp_server, smtp_port)
+                    server.ehlo()
+                    if smtp_port == 587:
+                        server.starttls()
+                        server.ehlo()
+                server.login(self.email_config.get('username', ''), self.email_config.get('password', ''))
                 server.send_message(msg)
                 server.quit()
-                
                 logger.info(f"📧 Email notification sent to {to_emails}")
                 break
-                
             except Exception as e:
                 logger.error(f"Failed to send email notification (attempt {attempt + 1}): {e}")
                 if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-    
+                    time.sleep(2 ** attempt)
+
     def send_slack_notification(self, message: str, urgency: str = 'normal'):
-        """Send enhanced Slack notification"""
         if not self.slack_config.get('enabled', False):
             return
-        
         try:
-            # Add urgency indicators
-            emoji_map = {
-                'low': '🔵',
-                'normal': '🟢', 
-                'high': '🟡',
-                'critical': '🔴'
-            }
-            
+            emoji_map = {'low': '🔵','normal': '🟢','high': '🟡','critical': '🔴'}
             payload = {
                 'text': f"{emoji_map.get(urgency, '🟢')} {message}",
                 'username': 'Bulk API Trigger Bot',
                 'icon_emoji': ':robot_face:',
                 'attachments': [{
-                    'color': 'good' if urgency in ['low', 'normal'] else 'warning' if urgency == 'high' else 'danger',
+                    'color': 'good' if urgency in ['low', 'normal'] else ('warning' if urgency == 'high' else 'danger'),
                     'ts': int(time.time())
                 }]
             }
-            
-            response = requests.post(self.slack_config['webhook_url'], json=payload, timeout=10)
-            if response.status_code == 200:
+            resp = requests.post(self.slack_config.get('webhook_url', ''), json=payload, timeout=10)
+            if resp.status_code == 200:
                 logger.info("📱 Slack notification sent successfully")
             else:
-                logger.error(f"Failed to send Slack notification: {response.status_code}")
-                
+                logger.error(f"Failed to send Slack notification: {resp.status_code}")
         except Exception as e:
             logger.error(f"Failed to send Slack notification: {e}")
-    
+
     def send_job_completion_notification(self, job_stats: Dict):
-        """Send comprehensive job completion notification"""
-        success_rate = (job_stats['successful_requests'] / job_stats['total_requests'] * 100) if job_stats['total_requests'] > 0 else 0
-        
-        # Determine urgency based on success rate
-        if success_rate >= 95:
-            urgency = 'normal'
-        elif success_rate >= 80:
-            urgency = 'high'
-        else:
-            urgency = 'critical'
-        
-        subject = f"Bulk API Job {'Completed' if success_rate > 0 else 'Failed'}: {job_stats['job_name']}"
-        
+        def _to_float(val, default=0.0):
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return default
+
+        total = job_stats.get('total_requests') or 0
+        succ  = job_stats.get('successful_requests') or 0
+        success_rate = (succ / total * 100.0) if total else 0.0
+        urgency = 'normal' if success_rate >= 95 else ('high' if success_rate >= 80 else 'critical')
+
+        # Slack
+        if self.slack_config.get('enabled') and self.slack_config.get('notify_on_completion', True):
+            slack_message = (
+                f"*🚀 Bulk API Job Completed*\n\n"
+                f"*Job:* {job_stats.get('job_name','')}\n"
+                f"*File:* {os.path.basename(job_stats.get('csv_file','Multiple files'))}\n"
+                f"*Triggered:* {job_stats.get('triggered_by','manual')}\n"
+                f"*Success Rate:* {success_rate:.2f}%\n"
+                f"*Requests:* {succ}/{total} successful\n"
+                f"*Duration:* {_to_float(job_stats.get('duration_seconds')):.2f}s\n"
+                f"*Avg Response:* {_to_float(job_stats.get('average_response_time')):.3f}s"
+            )
+            self.send_slack_notification(slack_message, urgency)
+
+        # Email
+        if self.email_config.get('enabled') and self.email_config.get('notify_on_completion', True):
+            subject = f"Bulk API Job {'Completed' if success_rate > 0 else 'Failed'}: {job_stats.get('job_name','')}"
+            html_body = f"""
+            <h2>🚀 Job Completion Report</h2>
+            <table border="1" cellpadding="10" style="border-collapse: collapse;">
+                <tr><td><strong>Job Name</strong></td><td>{job_stats.get('job_name','')}</td></tr>
+                <tr><td><strong>Job ID</strong></td><td>{job_stats.get('job_id','')}</td></tr>
+                <tr><td><strong>CSV File</strong></td><td>{job_stats.get('csv_file','Multiple files')}</td></tr>
+                <tr><td><strong>Triggered By</strong></td><td>{job_stats.get('triggered_by','manual')}</td></tr>
+                <tr><td><strong>Total Requests</strong></td><td>{total}</td></tr>
+                <tr><td><strong>✅ Successful</strong></td><td>{succ}</td></tr>
+                <tr><td><strong>❌ Failed</strong></td><td>{job_stats.get('failed_requests') or 0}</td></tr>
+                <tr><td><strong>📊 Success Rate</strong></td><td>{success_rate:.2f}%</td></tr>
+                <tr><td><strong>⏱️ Duration</strong></td><td>{_to_float(job_stats.get('duration_seconds')):.2f} seconds</td></tr>
+                <tr><td><strong>📈 Avg Response Time</strong></td><td>{_to_float(job_stats.get('average_response_time')):.3f}s</td></tr>
+                <tr><td><strong>🕐 Start Time</strong></td><td>{job_stats.get('start_time','')}</td></tr>
+                <tr><td><strong>🏁 End Time</strong></td><td>{job_stats.get('end_time','')}</td></tr>
+            </table>
+            """
+            self.send_email_notification(subject, html_body, self.email_config.get('recipients', []))
+
+    def send_file_detected_notification(self, file_info: Dict):
+        # Only Slack (keeps it lightweight)
+        if not self.slack_config.get('enabled') or not self.slack_config.get('notify_on_file_detected', True):
+            return
+        message = (
+            f"📁 *New CSV File Detected*\n\n"
+            f"*File:* {os.path.basename(file_info['csv_file'])}\n"
+            f"*Size:* {file_info['file_size']} bytes\n"
+            f"*Rows:* {file_info['row_count']} webhooks\n"
+            f"*Event:* {file_info['event_type']}\n"
+            f"*Time:* {file_info['detected_at']}\n\n"
+            f"Processing will start shortly..."
+        )
+        self.send_slack_notification(message, 'low')
+
+
+def _to_float(val, default=0.0):
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+def send_job_completion_notification(self, job_stats: Dict):
+    # compute success/urgency
+    total = job_stats.get('total_requests') or 0
+    succ  = job_stats.get('successful_requests') or 0
+    success_rate = (succ / total * 100.0) if total else 0.0
+
+    urgency = 'normal' if success_rate >= 95 else 'high' if success_rate >= 80 else 'critical'
+
+    # --- Send Slack FIRST (never blocked by email formatting) ---
+    if self.slack_config.get('enabled') and self.slack_config.get('notify_on_completion'):
+        slack_message = (
+            f"*🚀 Bulk API Job Completed*\n\n"
+            f"*Job:* {job_stats.get('job_name','')}\n"
+            f"*File:* {os.path.basename(job_stats.get('csv_file','Multiple files'))}\n"
+            f"*Triggered:* {job_stats.get('triggered_by','manual')}\n"
+            f"*Success Rate:* {success_rate:.2f}%\n"
+            f"*Requests:* {succ}/{total} successful\n"
+            f"*Duration:* {_to_float(job_stats.get('duration_seconds')):.2f}s\n"
+            f"*Avg Response:* {_to_float(job_stats.get('average_response_time')):.3f}s"
+        )
+        self.send_slack_notification(slack_message, urgency)
+
+    # --- Only build/send email if enabled ---
+    if self.email_config.get('enabled') and self.email_config.get('notify_on_completion'):
+        subject = f"Bulk API Job {'Completed' if success_rate > 0 else 'Failed'}: {job_stats.get('job_name','')}"
         html_body = f"""
         <h2>🚀 Job Completion Report</h2>
         <table border="1" cellpadding="10" style="border-collapse: collapse;">
-            <tr><td><strong>Job Name</strong></td><td>{job_stats['job_name']}</td></tr>
-            <tr><td><strong>Job ID</strong></td><td>{job_stats['job_id']}</td></tr>
-            <tr><td><strong>CSV File</strong></td><td>{job_stats.get('csv_file', 'Multiple files')}</td></tr>
-            <tr><td><strong>Triggered By</strong></td><td>{job_stats.get('triggered_by', 'manual')}</td></tr>
-            <tr><td><strong>Total Requests</strong></td><td>{job_stats['total_requests']}</td></tr>
-            <tr><td><strong>✅ Successful</strong></td><td>{job_stats['successful_requests']}</td></tr>
-            <tr><td><strong>❌ Failed</strong></td><td>{job_stats['failed_requests']}</td></tr>
+            <tr><td><strong>Job Name</strong></td><td>{job_stats.get('job_name','')}</td></tr>
+            <tr><td><strong>Job ID</strong></td><td>{job_stats.get('job_id','')}</td></tr>
+            <tr><td><strong>CSV File</strong></td><td>{job_stats.get('csv_file','Multiple files')}</td></tr>
+            <tr><td><strong>Triggered By</strong></td><td>{job_stats.get('triggered_by','manual')}</td></tr>
+            <tr><td><strong>Total Requests</strong></td><td>{total}</td></tr>
+            <tr><td><strong>✅ Successful</strong></td><td>{succ}</td></tr>
+            <tr><td><strong>❌ Failed</strong></td><td>{job_stats.get('failed_requests') or 0}</td></tr>
             <tr><td><strong>📊 Success Rate</strong></td><td>{success_rate:.2f}%</td></tr>
-            <tr><td><strong>⏱️ Duration</strong></td><td>{job_stats.get('duration_seconds', 0):.2f} seconds</td></tr>
-            <tr><td><strong>📈 Avg Response Time</strong></td><td>{job_stats.get('average_response_time', 0):.3f}s</td></tr>
-            <tr><td><strong>🕐 Start Time</strong></td><td>{job_stats['start_time']}</td></tr>
-            <tr><td><strong>🏁 End Time</strong></td><td>{job_stats['end_time']}</td></tr>
+            <tr><td><strong>⏱️ Duration</strong></td><td>{_to_float(job_stats.get('duration_seconds')):.2f} seconds</td></tr>
+            <tr><td><strong>📈 Avg Response Time</strong></td><td>{_to_float(job_stats.get('average_response_time')):.3f}s</td></tr>
+            <tr><td><strong>🕐 Start Time</strong></td><td>{job_stats.get('start_time','')}</td></tr>
+            <tr><td><strong>🏁 End Time</strong></td><td>{job_stats.get('end_time','')}</td></tr>
         </table>
         """
         
-        slack_message = f"""
-*🚀 Bulk API Job Completed*
-
-*Job:* {job_stats['job_name']}
-*File:* {os.path.basename(job_stats.get('csv_file', 'Multiple files'))}
-*Triggered:* {job_stats.get('triggered_by', 'manual')}
-*Success Rate:* {success_rate:.2f}%
-*Requests:* {job_stats['successful_requests']}/{job_stats['total_requests']} successful
-*Duration:* {job_stats.get('duration_seconds', 0):.2f}s
-*Avg Response:* {job_stats.get('average_response_time', 0):.3f}s
-        """
-        
-        # Send notifications
-        if self.email_config.get('enabled') and self.email_config.get('notify_on_completion'):
-            self.send_email_notification(subject, html_body, self.email_config.get('recipients', []))
-        
-        if self.slack_config.get('enabled') and self.slack_config.get('notify_on_completion'):
-            self.send_slack_notification(slack_message, urgency)
+        self.send_email_notification(subject, html_body, self.email_config.get('recipients', []))
+        logger.info(f"📧 Email notification sent for job {job_stats.get('job_id','')} completion")
     
+    # --- Send file detected notification if enabled ---
     def send_file_detected_notification(self, file_info: Dict):
         """Send notification when new file is detected"""
         message = f"""
@@ -1147,6 +1226,8 @@ def archive_processed_file(file_path: str, config: Dict) -> bool:
 class BulkAPITrigger:
     def __init__(self, config: Dict):
         self.config = config
+        self.inflight_lock = Lock()
+        self.inflight_files: Set[str] = set()
         self.db_manager = DatabaseManager(config.get('database', {}).get('path', '/app/data/webhook_results.db'))
         self.notification_manager = NotificationManager(config.get('notifications', {}))
         self.job_queue = queue.Queue(maxsize=config.get('watchdog', {}).get('max_queue_size', 100))
@@ -1330,7 +1411,10 @@ class BulkAPITrigger:
         
         # Initialize file system observer
         self.observer = Observer()
-        event_handler = FileWatchdog(self.job_queue, self.db_manager, self.config)
+        event_handler = FileWatchdog(
+            self.job_queue, self.db_manager, self.config,
+            inflight_files=self.inflight_files, inflight_lock=self.inflight_lock
+                )
         
         for path in watch_paths:
             self.observer.schedule(event_handler, path, recursive=False)
@@ -1345,70 +1429,66 @@ class BulkAPITrigger:
     
     def _process_queue_worker(self):
         """Background worker to process queued jobs"""
-        debounce_delay = self.config.get('watchdog', {}).get('debounce_delay', 3.0)
-        
-        while not self.shutdown_event.is_set():
+    debounce_delay = self.config.get('watchdog', {}).get('debounce_delay', 3.0)
+
+    while not self.shutdown_event.is_set():
+        try:
+            job_info = self.job_queue.get(timeout=1.0)
             try:
-                # Wait for job with timeout
-                job_info = self.job_queue.get(timeout=1.0)
-                
-                # Debounce delay to avoid processing rapidly changing files
                 logger.info(f"⏳ Debouncing file: {os.path.basename(job_info['csv_file'])} ({debounce_delay}s)")
                 time.sleep(debounce_delay)
-                
-                # Check if file still exists and hasn't been processed by another job
+
+                # Missing file?
                 if not os.path.exists(job_info['csv_file']):
                     logger.warning(f"File no longer exists: {job_info['csv_file']}")
-                    self.job_queue.task_done()
+                    self.db_manager.update_file_status(job_info['csv_file'], 'failed')
                     continue
-                
-                # Check if file was already processed
+
+                # Changed during debounce? Requeue (keep inflight)
                 current_hash = self._calculate_file_hash(job_info['csv_file'])
-                if current_hash != job_info['file_hash']:
+                if current_hash and current_hash != job_info['file_hash']:
                     logger.info(f"File changed during debounce, re-queuing: {job_info['csv_file']}")
-                    # Re-queue with new hash
                     job_info['file_hash'] = current_hash
                     self.job_queue.put(job_info)
-                    self.job_queue.task_done()
                     continue
-                
+
+                # Already completed?
                 if self.db_manager.is_file_processed(job_info['csv_file'], job_info['file_hash']):
                     logger.info(f"File already processed: {os.path.basename(job_info['csv_file'])}")
-                    self.job_queue.task_done()
                     continue
-                
-                # Send file detected notification
+
+                # Optional: notify detected (if you prefer at worker time)
                 self.notification_manager.send_file_detected_notification(job_info)
-                
-                # Process the file
+
+                # Processing start
                 job_name = f"Auto: {os.path.basename(job_info['csv_file'])}"
                 logger.info(f"🎬 Auto-processing file: {os.path.basename(job_info['csv_file'])}")
-                
-                # Update file status to processing
                 self.db_manager.update_file_status(job_info['csv_file'], 'processing')
-                
+
                 try:
                     job_id = self.trigger_webhooks(
                         csv_files=[job_info['csv_file']],
                         job_name=job_name,
                         triggered_by='watchdog'
                     )
-                    
-                    # Mark file as completed
                     self.db_manager.update_file_status(job_info['csv_file'], 'completed', job_id)
                     logger.info(f"✅ Auto-processing completed for: {os.path.basename(job_info['csv_file'])}")
-                    
                 except Exception as e:
                     logger.error(f"❌ Auto-processing failed for {job_info['csv_file']}: {e}")
                     self.db_manager.update_file_status(job_info['csv_file'], 'failed')
-                
+
+            finally:
+                # ALWAYS release inflight + task_done
+                with self.inflight_lock:
+                    self.inflight_files.discard(job_info['csv_file'])
                 self.job_queue.task_done()
-                
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f"Error in queue processing worker: {e}")
-                logger.error(traceback.format_exc())
+
+        except queue.Empty:
+            continue
+        except Exception as e:
+            logger.error(f"Error in queue processing worker: {e}")
+            logger.error(traceback.format_exc())
+
     
     def _calculate_file_hash(self, file_path: str) -> str:
         """Calculate file hash for duplicate detection"""
@@ -1716,8 +1796,14 @@ def scan_existing_files(trigger: BulkAPITrigger):
                     'detected_at': datetime.now().isoformat()
                 }
                 
+                trigger.db_manager.track_file(csv_file, file_hash, file_stats.st_size, row_count=0)
+                trigger.db_manager.update_file_status(csv_file, 'queued')
+
+                with trigger.inflight_lock:
+                    trigger.inflight_files.add(csv_file)
+
                 trigger.job_queue.put(job_info)
-                logger.info(f"📄 Queued existing file: {os.path.basename(csv_file)}")
+                logger.info(f"📄 Queued existing file: {os.path.basename(csv_file)}")   
                 
             except Exception as e:
                 logger.error(f"Error scanning file {csv_file}: {e}")
