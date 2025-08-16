@@ -25,7 +25,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/logs/webhook_trigger.log'),
+        logging.FileHandler('webhook_trigger.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -791,7 +791,7 @@ def load_environment_config():
         },
         'database': {
             'enabled': os.getenv('DATABASE_ENABLED', 'true').lower() == 'true',
-            'path': os.getenv('DATABASE_PATH', '/data/webhook_results.db')
+            'path': os.getenv('DATABASE_PATH', 'webhook_results.db')
         }
     }
 
