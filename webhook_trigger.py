@@ -25,7 +25,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('webhook_trigger.log'),
+        logging.FileHandler('/logs/webhook_trigger.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -388,7 +388,7 @@ class EnhancedResultsTracker:
     def save_results(self, filename: Optional[str] = None):
         """Save results to JSON file (legacy support)"""
         if not filename:
-            filename = f'webhook_results_{self.job_id}.json'
+            filename = f'/logs/webhook_results_{self.job_id}.json'
         
         with self.lock:
             try:
@@ -791,7 +791,7 @@ def load_environment_config():
         },
         'database': {
             'enabled': os.getenv('DATABASE_ENABLED', 'true').lower() == 'true',
-            'path': os.getenv('DATABASE_PATH', 'webhook_results.db')
+            'path': os.getenv('DATABASE_PATH', '/data/webhook_results.db')
         }
     }
 
