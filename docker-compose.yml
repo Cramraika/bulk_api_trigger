@@ -62,5 +62,4 @@ services:
   #     - bulk-api-trigger
 
 volumes:
-  data:
-  logs:
+   - "/home/apps.chinmayramraika.in/BulkApiTrigger:/app/data"
