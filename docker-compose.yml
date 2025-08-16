@@ -13,6 +13,8 @@ services:
       - DEPLOYMENT_MODE=true
       - KEEP_ALIVE=true
       - JOB_NAME=Docker Bulk API Job
+      - WATCHDOG_ENABLED=true
+      - WATCH_PATHS=/app/data/csv
       
       # Rate Limiting
       - MAX_WORKERS=5
