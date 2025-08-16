@@ -32,7 +32,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class DatabaseManager:
-    def __init__(self, db_path='/data/webhook_results.db'):
+    def __init__(self, db_path='/app/data/webhook_results.db'):
         self.db_path = db_path
         self.init_database()
     
@@ -388,7 +388,7 @@ class EnhancedResultsTracker:
     def save_results(self, filename: Optional[str] = None):
         """Save results to JSON file (legacy support)"""
         if not filename:
-            filename = f'/data/logs/webhook_results_{self.job_id}.json'
+            filename = f'/app/data/logs/webhook_results_{self.job_id}.json'
         
         with self.lock:
             try:
@@ -603,7 +603,7 @@ def generate_job_id(prefix: str = "job") -> str:
 class BulkAPITrigger:
     def __init__(self, config: Dict):
         self.config = config
-        self.db_manager = DatabaseManager(config.get('database', {}).get('path', '/data/webhook_results.db'))
+        self.db_manager = DatabaseManager(config.get('database', {}).get('path', '/app/data/webhook_results.db'))
         self.notification_manager = NotificationManager(config.get('notifications', {}))
     
     def trigger_webhooks(self, 
@@ -787,7 +787,7 @@ def load_environment_config():
         },
         'database': {
             'enabled': os.getenv('DATABASE_ENABLED', 'true').lower() == 'true',
-            'path': os.getenv('DATABASE_PATH', '/data/webhook_results.db')
+            'path': os.getenv('DATABASE_PATH', '/app/data/webhook_results.db')
         }
     }
 

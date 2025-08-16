@@ -30,7 +30,7 @@ EXPOSE 8000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import sqlite3; conn=sqlite3.connect('/data/webhook_results.db'); conn.close()" || exit 1
+    CMD python -c "import sqlite3; conn=sqlite3.connect('/app/data/webhook_results.db'); conn.close()" || exit 1
 
 # Run the application
 CMD ["python", "webhook_trigger.py"]
