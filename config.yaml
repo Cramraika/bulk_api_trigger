@@ -54,8 +54,7 @@ csv:
     - group
   chunk_size: 1000
   file_patterns:
-    - "**/*.csv"
-    - "*.csv"
+    - "/csv/*.csv"
 
 # Deployment settings
 deployment:
