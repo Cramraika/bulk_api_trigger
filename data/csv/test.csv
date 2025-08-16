@@ -1,5 +1,0 @@
-webhook_url,method,name,group
-https://httpbin.org/post,POST,Test Webhook 1,testing
-https://httpbin.org/post,POST,Test Webhook 1,testing
-https://httpbin.org/post,POST,Test Webhook 1,testing
-https://httpbin.org/post,POST,Test Webhook 1,testing
