@@ -40,7 +40,7 @@ notifications:
 # Database settings
 database:
   enabled: true
-  path: webhook_results.db
+  path: /data/webhook_results.db
 
 # CSV processing settings
 csv:
@@ -54,7 +54,7 @@ csv:
     - group
   chunk_size: 1000
   file_patterns:
-    - "/csv/*.csv"
+    - "/data/csv/*.csv"
 
 # Deployment settings
 deployment:

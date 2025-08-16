@@ -32,7 +32,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class DatabaseManager:
-    def __init__(self, db_path='webhook_results.db'):
+    def __init__(self, db_path='/data/webhook_results.db'):
         self.db_path = db_path
         self.init_database()
     
@@ -328,7 +328,7 @@ class ConfigManager:
             },
             'database': {
                 'enabled': True,
-                'path': 'webhook_results.db'
+                'path': '/data/webhook_results.db'
             },
             'csv': {
                 'required_columns': ['webhook_url'],
@@ -388,7 +388,7 @@ class EnhancedResultsTracker:
     def save_results(self, filename: Optional[str] = None):
         """Save results to JSON file (legacy support)"""
         if not filename:
-            filename = f'/logs/webhook_results_{self.job_id}.json'
+            filename = f'/data/logs/webhook_results_{self.job_id}.json'
         
         with self.lock:
             try:
@@ -556,7 +556,7 @@ def read_multiple_csv_files(file_patterns: List[str] = None, chunk_size: int = 1
     """Enhanced multi-file CSV reader"""
     if not file_patterns:
         file_patterns = [
-            '/csv/*.csv'
+            '/app/data/csv/*.csv'
         ]
     
     found_files = []
@@ -603,7 +603,7 @@ def generate_job_id(prefix: str = "job") -> str:
 class BulkAPITrigger:
     def __init__(self, config: Dict):
         self.config = config
-        self.db_manager = DatabaseManager(config.get('database', {}).get('path', 'webhook_results.db'))
+        self.db_manager = DatabaseManager(config.get('database', {}).get('path', '/data/webhook_results.db'))
         self.notification_manager = NotificationManager(config.get('notifications', {}))
     
     def trigger_webhooks(self, 
@@ -787,7 +787,7 @@ def load_environment_config():
         },
         'database': {
             'enabled': os.getenv('DATABASE_ENABLED', 'true').lower() == 'true',
-            'path': os.getenv('DATABASE_PATH', 'webhook_results.db')
+            'path': os.getenv('DATABASE_PATH', '/data/webhook_results.db')
         }
     }
 

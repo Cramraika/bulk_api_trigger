@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Create directories for data and logs
-RUN mkdir -p /app/data /app/logs
+RUN mkdir -p /app/data /app/data/logs
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
@@ -30,7 +30,7 @@ EXPOSE 8000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import sqlite3; conn=sqlite3.connect('webhook_results.db'); conn.close()" || exit 1
+    CMD python -c "import sqlite3; conn=sqlite3.connect('/data/webhook_results.db'); conn.close()" || exit 1
 
 # Run the application
 CMD ["python", "webhook_trigger.py"]
