@@ -31,6 +31,12 @@ from contextlib import contextmanager
 # Configure logging with rotation
 from logging.handlers import RotatingFileHandler
 
+def _to_float(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
 def setup_logging():
     """Setup enhanced logging with rotation"""
     log_formatter = logging.Formatter(
@@ -305,9 +311,9 @@ class DatabaseManager:
             for row in cursor.fetchall():
                 status_stats[row[0]] = {
                     'count': row[1],
-                    'avg_response_time': row[2] or 0,
-                    'min_response_time': row[3] or 0,
-                    'max_response_time': row[4] or 0
+                    'avg_response_time': _to_float(job[2], 0.0),
+                    'min_response_time': _to_float(job[3], 0.0),
+                    'max_response_time': _to_float(job[4], 0.0)
                 }
             
             if job:
@@ -315,14 +321,14 @@ class DatabaseManager:
                     'job_id': job[0],
                     'job_name': job[1],
                     'csv_file': job[2],
-                    'total_requests': job[3],
-                    'successful_requests': job[4],
-                    'failed_requests': job[5],
+                    'total_requests': _to_float(job[3], 0.0),
+                    'successful_requests': _to_float(job[4], 0.0),
+                    'failed_requests': _to_float(job[5], 0.0),
                     'start_time': job[6],
                     'end_time': job[7],
-                    'duration_seconds': job[8],
+                    'duration_seconds': duration,
                     'triggered_by': job[10],
-                    'average_response_time': job[11],
+                    'average_response_time': avg_rt,
                     'status_breakdown': status_stats
                 }
         return {}
