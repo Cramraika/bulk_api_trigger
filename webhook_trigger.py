@@ -921,119 +921,142 @@ class EnhancedResultsTracker:
                 'throughput': len(self.results) / elapsed if elapsed > 0 else 0
             }
 
-def make_request(url, method, payload, header, retries, rate_limiter, pbar, results_tracker, request_timeout=30):
-    """Enhanced request function with comprehensive metrics and error handling"""
-    with rate_limiter.semaphore:
-        rate_limiter.wait_if_needed()
-        
-        start_time = time.time()
-        last_error = None
-        request_size = 0
-        response_size = 0
-        headers_sent = {}
-        
-        for attempt in range(retries):
-            try:
-                # Determine HTTP method
-                if not method:
-                    method_to_use = "POST" if payload else "GET"
-                else:
-                    method_to_use = method.upper()
-                
-                # Prepare headers
-                headers = {'User-Agent': 'Bulk-API-Trigger/2.0'}
-                if header:
-                    try:
-                        custom_headers = json.loads(header)
-                        if isinstance(custom_headers, dict):
-                            headers.update(custom_headers)
-                    except Exception as e:
-                        logger.error(f"Error parsing header JSON for {url}: {e}")
-                
-                headers_sent = headers.copy()
-                
-                # Prepare request parameters
-                request_params = {
-                    'timeout': request_timeout,
-                    'headers': headers,
-                    'allow_redirects': True,
-                    'stream': False
-                }
-                
-                # Add payload if present
-                if payload and method_to_use in ['POST', 'PUT', 'PATCH']:
-                    try:
-                        json_payload = json.loads(payload)
-                        request_params['json'] = json_payload
-                        request_size = len(json.dumps(json_payload).encode('utf-8'))
-                    except json.JSONDecodeError:
-                        request_params['data'] = payload
-                        headers['Content-Type'] = 'text/plain'
-                        request_size = len(payload.encode('utf-8'))
-                else:
-                    request_size = len(json.dumps(headers).encode('utf-8'))
+def make_request(
+    url,
+    method,
+    payload,
+    header,
+    retries,
+    rate_limiter,
+    pbar,
+    results_tracker,
+    request_timeout=30,
+    global_sema=None,   # ← NEW: optional global semaphore
+):
+    """Enhanced request function with optional global concurrency cap."""
+    # Always acquire locks/semaphores in a consistent order to avoid deadlocks.
+    # We acquire the *global* semaphore first (if any), then the per-file semaphore.
+    acquired_global = False
+    try:
+        if global_sema is not None:
+            global_sema.acquire()
+            acquired_global = True
 
-                # Execute the request
-                response = requests.request(method_to_use, url, **request_params)
-                
-                # Calculate metrics
-                response_time = time.time() - start_time
-                response_size = len(response.content)
-                response_preview = response.text[:200] + "..." if len(response.text) > 200 else response.text
-                
-                if response.status_code in [200, 201, 202, 204]:
-                    logger.debug(f"✅ Success: {url} [{response.status_code}] ({response_time:.2f}s)")
-                    
-                    results_tracker.add_result({
-                        'url': url,
-                        'method': method_to_use,
-                        'status': 'success',
-                        'status_code': response.status_code,
-                        'timestamp': datetime.now().isoformat(),
-                        'response_time': response_time,
-                        'attempt': attempt + 1,
-                        'response_preview': response_preview,
-                        'request_size': request_size,
-                        'response_size': response_size,
-                        'headers_sent': headers_sent
-                    })
-                    
-                    pbar.update(1)
-                    return 0
-                else:
-                    last_error = f"HTTP {response.status_code}: {response.text[:100]}"
-                    logger.warning(f"❌ Error: {url} [Status: {response.status_code}] (attempt {attempt + 1}/{retries})")
-                    
-            except requests.exceptions.Timeout:
-                last_error = f"Timeout after {request_timeout}s"
-                logger.error(f"⏰ Timeout: {url} (attempt {attempt + 1}/{retries})")
-            except requests.exceptions.ConnectionError as e:
-                last_error = f"Connection error: {str(e)[:100]}"
-                logger.error(f"🔌 Connection error: {url} (attempt {attempt + 1}/{retries})")
-            except Exception as e:
-                last_error = f"Unexpected error: {str(e)[:100]}"
-                logger.error(f"💥 Error: {url}, Exception: {e} (attempt {attempt + 1}/{retries})")
-            
-            if attempt < retries - 1:
-                time.sleep(min(2 ** attempt, 10))  # Exponential backoff with cap
+        with rate_limiter.semaphore:
+            rate_limiter.wait_if_needed()
 
-        # All retries failed
-        results_tracker.add_result({
-            'url': url,
-            'method': method_to_use if 'method_to_use' in locals() else 'UNKNOWN',
-            'status': 'failed',
-            'status_code': response.status_code if 'response' in locals() else None,
-            'timestamp': datetime.now().isoformat(),
-            'response_time': time.time() - start_time,
-            'attempt': retries,
-            'error_message': last_error,
-            'request_size': request_size,
-            'response_size': response_size if 'response_size' in locals() else 0,
-            'headers_sent': headers_sent
-        })
-        
-        pbar.update(1)
-        return 1
+            start_time = time.time()
+            last_error = None
+            request_size = 0
+            response_size = 0
+            headers_sent = {}
+
+            for attempt in range(retries):
+                try:
+                    # Determine HTTP method
+                    if not method:
+                        method_to_use = "POST" if payload else "GET"
+                    else:
+                        method_to_use = method.upper()
+
+                    # Prepare headers
+                    headers = {'User-Agent': 'Bulk-API-Trigger/2.0'}
+                    if header:
+                        try:
+                            custom_headers = json.loads(header)
+                            if isinstance(custom_headers, dict):
+                                headers.update(custom_headers)
+                        except Exception as e:
+                            logger.error(f"Error parsing header JSON for {url}: {e}")
+
+                    headers_sent = headers.copy()
+
+                    # Prepare request parameters
+                    request_params = {
+                        'timeout': request_timeout,
+                        'headers': headers,
+                        'allow_redirects': True,
+                        'stream': False
+                    }
+
+                    # Add payload if present
+                    if payload and method_to_use in ['POST', 'PUT', 'PATCH']:
+                        try:
+                            json_payload = json.loads(payload)
+                            request_params['json'] = json_payload
+                            request_size = len(json.dumps(json_payload).encode('utf-8'))
+                        except json.JSONDecodeError:
+                            request_params['data'] = payload
+                            headers['Content-Type'] = 'text/plain'
+                            request_size = len(payload.encode('utf-8'))
+                    else:
+                        request_size = len(json.dumps(headers).encode('utf-8'))
+
+                    # Execute the request
+                    response = requests.request(method_to_use, url, **request_params)
+
+                    # Calculate metrics
+                    response_time = time.time() - start_time
+                    response_size = len(response.content)
+                    response_preview = response.text[:200] + "..." if len(response.text) > 200 else response.text
+
+                    if response.status_code in [200, 201, 202, 204]:
+                        logger.debug(f"✅ Success: {url} [{response.status_code}] ({response_time:.2f}s)")
+
+                        results_tracker.add_result({
+                            'url': url,
+                            'method': method_to_use,
+                            'status': 'success',
+                            'status_code': response.status_code,
+                            'timestamp': datetime.now().isoformat(),
+                            'response_time': response_time,
+                            'attempt': attempt + 1,
+                            'response_preview': response_preview,
+                            'request_size': request_size,
+                            'response_size': response_size,
+                            'headers_sent': headers_sent
+                        })
+
+                        pbar.update(1)
+                        return 0
+                    else:
+                        last_error = f"HTTP {response.status_code}: {response.text[:100]}"
+                        logger.warning(f"❌ Error: {url} [Status: {response.status_code}] (attempt {attempt + 1}/{retries})")
+
+                except requests.exceptions.Timeout:
+                    last_error = f"Timeout after {request_timeout}s"
+                    logger.error(f"⏰ Timeout: {url} (attempt {attempt + 1}/{retries})")
+                except requests.exceptions.ConnectionError as e:
+                    last_error = f"Connection error: {str(e)[:100]}"
+                    logger.error(f"🔌 Connection error: {url} (attempt {attempt + 1}/{retries})")
+                except Exception as e:
+                    last_error = f"Unexpected error: {str(e)[:100]}"
+                    logger.error(f"💥 Error: {url}, Exception: {e} (attempt {attempt + 1}/{retries})")
+
+                if attempt < retries - 1:
+                    time.sleep(min(2 ** attempt, 10))  # Exponential backoff with cap
+
+            # All retries failed
+            results_tracker.add_result({
+                'url': url,
+                'method': method_to_use if 'method_to_use' in locals() else 'UNKNOWN',
+                'status': 'failed',
+                'status_code': response.status_code if 'response' in locals() else None,
+                'timestamp': datetime.now().isoformat(),
+                'response_time': time.time() - start_time,
+                'attempt': retries,
+                'error_message': last_error,
+                'request_size': request_size,
+                'response_size': response_size if 'response_size' in locals() else 0,
+                'headers_sent': headers_sent
+            })
+
+            pbar.update(1)
+            return 1
+
+    finally:
+        if acquired_global:
+            global_sema.release()
 
 def read_csv_with_validation(csv_file: str, chunk_size: int = 1000, skip_rows: int = 0) -> Tuple[List, Dict]:
     """Enhanced CSV reader with comprehensive validation and statistics"""
@@ -1233,6 +1256,8 @@ class BulkAPITrigger:
         self.config = config
         self.inflight_lock = Lock()
         self.inflight_files: Set[str] = set()
+        gmax = int(os.getenv('GLOBAL_MAX_REQUESTS', '0') or '0')
+        self.global_request_sema = Semaphore(gmax) if gmax > 0 else None
         self.db_manager = DatabaseManager(config.get('database', {}).get('path', '/app/data/webhook_results.db'))
         self.notification_manager = NotificationManager(config.get('notifications', {}))
         self.job_queue = queue.Queue(maxsize=config.get('watchdog', {}).get('max_queue_size', 100))
@@ -1317,7 +1342,8 @@ class BulkAPITrigger:
                             rate_limiter, 
                             pbar, 
                             results_tracker,
-                            self.config.get('retry', {}).get('timeout', 30)
+                            self.config.get('retry', {}).get('timeout', 30),
+                            self.global_request_sema
                         ): webhook 
                         for webhook in all_webhooks
                     }
@@ -1436,37 +1462,32 @@ class BulkAPITrigger:
             raise
     
     def start_watchdog(self):
-        """Start the file system watchdog"""
         if not self.watchdog_enabled:
             logger.info("📁 Watchdog disabled in configuration")
             return
-        
+
         watch_paths = self.config.get('watchdog', {}).get('watch_paths', ['/app/data/csv'])
-        
-        # Create watch directories if they don't exist
         for path in watch_paths:
             os.makedirs(path, exist_ok=True)
-        
+
         logger.info(f"👀 Starting watchdog for paths: {watch_paths}")
-        
-        # Initialize file system observer
+
         self.observer = Observer()
-        
-        event_handler = FileWatchdog(
-            self.job_queue, self.db_manager, self.config,
-            inflight_files=self.inflight_files, inflight_lock=self.inflight_lock
-                )
-        
+        event_handler = FileWatchdog(self.job_queue, self.db_manager, self.config)
         for path in watch_paths:
             self.observer.schedule(event_handler, path, recursive=False)
-        
         self.observer.start()
-        
-        # Start processing thread
-        self.processing_thread = Thread(target=self._process_queue_worker, daemon=True)
-        self.processing_thread.start()
-        
-        logger.info("🚀 Watchdog system started successfully")
+
+        # NEW: multiple file-processing workers
+        worker_count = int(os.getenv('PROCESSING_WORKERS', '1'))
+        self.processing_threads = []
+        for i in range(worker_count):
+            t = Thread(target=self._process_queue_worker, name=f"file-worker-{i+1}", daemon=True)
+            t.start()
+            self.processing_threads.append(t)
+
+        logger.info(f"🚀 Watchdog system started successfully with {worker_count} file worker(s)")
+
     
     def _process_queue_worker(self):
         """Background worker to process queued jobs"""
@@ -1502,7 +1523,7 @@ class BulkAPITrigger:
                     self.notification_manager.send_file_detected_notification(job_info)
 
                     # Processing start
-                    job_name = f"Auto: {os.path.basename(job_info['csv_file'])}"
+                    job_name = f"{os.path.basename(job_info['csv_file'])}"
                     logger.info(f"🎬 Auto-processing file: {os.path.basename(job_info['csv_file'])}")
                     self.db_manager.update_file_status(job_info['csv_file'], 'processing')
 
@@ -1549,7 +1570,9 @@ class BulkAPITrigger:
         logger.info("🛑 Stopping watchdog system...")
         
         self.shutdown_event.set()
-        
+        if getattr(self, 'processing_threads', None):
+            for t in self.processing_threads:
+                t.join(timeout=10)
         if self.observer:
             self.observer.stop()
             self.observer.join()
