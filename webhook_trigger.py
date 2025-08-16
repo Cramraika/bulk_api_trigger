@@ -27,7 +27,10 @@ import queue
 import re
 import traceback
 from contextlib import contextmanager
-
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 # Configure logging with rotation
 from logging.handlers import RotatingFileHandler
 
@@ -59,8 +62,10 @@ def setup_logging():
     console_handler.setFormatter(log_formatter)
     
     # Root logger
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(level) 
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
     
@@ -1289,8 +1294,17 @@ class BulkAPITrigger:
             
             # Execute requests
             with ThreadPoolExecutor(max_workers=rate_config.get('max_workers', 3)) as executor:
-                with tqdm(total=total_requests, desc="🌐 API Requests", dynamic_ncols=True, 
-                         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
+                with tqdm(
+                            total=total_requests,
+                            desc="🌐 API Requests",
+                            dynamic_ncols=False,              # avoid querying terminal width
+                            ascii=True,                       # safer in non-UTF8 log renderers
+                            file=sys.stdout,                  # write to stdout (your StreamHandler already uses stdout)
+                            mininterval=1.0,                  # throttle redraws to avoid spam
+                            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+                            # If not a TTY, only show if user explicitly forces it
+                            disable=not (sys.stdout.isatty() or os.getenv("FORCE_TQDM","0") == "1")
+                        ) as pbar:
                     
                     futures = {
                         executor.submit(
@@ -1318,15 +1332,41 @@ class BulkAPITrigger:
                             processed_count += 1
                             if error == 0:
                                 successful_count += 1
+                                try:
+                                    if (
+                                        self.notification_manager.slack_config.get('enabled')
+                                        and os.getenv("SLACK_NOTIFY_PROGRESS", "false").lower() == "true"
+                                        and processed_count % int(os.getenv("SLACK_PROGRESS_EVERY_N", "25")) == 0
+                                    ):
+                                        urgency = os.getenv("SLACK_PROGRESS_URGENCY", "auto")
+                                        if urgency == "auto":
+                                            urgency = _slack_urgency_for_progress(successful_count, processed_count)
+
+                                        self.notification_manager.send_slack_notification(
+                                            (
+                                                f"⏳ *{job_name}* in progress\n"
+                                                f"{processed_count}/{total_requests} processed\n"
+                                                f"✅ {successful_count} success | ❌ {failed_count} failed\n"
+                                                f"~{(processed_count/total_requests*100):.1f}% done"
+                                            ),
+                                            urgency
+                                        )
+                                except Exception:
+                                    # Don’t let progress Slack failures break the job
+                                    pass
                             else:
                                 failed_count += 1
                             
                             # Progress updates
-                            if processed_count % 50 == 0:
+                            PROGRESS_EVERY_N = int(os.getenv("PROGRESS_EVERY_N", "50"))
+                            ...
+                            if processed_count % PROGRESS_EVERY_N == 0:
                                 success_rate = (successful_count / processed_count) * 100
                                 throughput = rate_limiter.get_throughput()
-                                logger.info(f"📈 Progress: {processed_count}/{total_requests} "
-                                          f"({success_rate:.1f}% success, {throughput:.2f} req/s)")
+                                logger.info(
+                                        f"📈 Progress: {processed_count}/{total_requests} "
+                                        f"({success_rate:.1f}% success, {throughput:.2f} req/s)"
+                                        )   
                             
                         except Exception as e:
                             webhook = futures[future]
@@ -1490,6 +1530,7 @@ class BulkAPITrigger:
                 logger.error(f"Error in queue processing worker: {e}")
                 logger.error(traceback.format_exc())
 
+
     
     def _calculate_file_hash(self, file_path: str) -> str:
         """Calculate file hash for duplicate detection"""
@@ -1543,6 +1584,16 @@ class BulkAPITrigger:
                 return True
         except Exception:
             return False
+
+def _slack_urgency_for_progress(successful, processed):
+    if processed == 0:
+        return 'normal'
+    sr = (successful / processed) * 100.0
+    if sr >= 95:  
+        return 'normal'
+    if sr >= 80:  
+        return 'high'
+    return 'critical'
 
 def load_environment_config():
     """Load configuration from environment variables with watchdog support"""
