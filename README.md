@@ -45,98 +45,128 @@ docker build -t bulk-api-trigger .
 docker run -v ./csv:/app/csv -v ./data:/app/data bulk-api-trigger
 ```
 
-### 3. Coolify Deployment
+## 📂 Project Structure
+- `/app/data/csv` → Incoming CSV files to process  
+- `/app/data/csv/processed` → Archived processed files  
+- `/app/data/webhook_results.db` → SQLite database for job logs  
+- `/app/data/logs` → JSON logs of webhook results  
 
-1. **Create new project** in Coolify
-2. **Upload files** to your repository:
-   ```
-   webhook_trigger.py
-   requirements.txt
-   Procfile
-   config.yaml (optional)
-   your_csv_files.csv
-   ```
-3. **Set environment variables**:
-   ```bash
-   DEPLOYMENT_MODE=true
-   KEEP_ALIVE=true
-   MAX_WORKERS=3
-   BASE_RATE_LIMIT=2.0
-   JOB_NAME=My Coolify Job
-   ```
-4. **Deploy** and monitor logs
+---
 
-### 4. Railway Deployment
+## ⚙️ Environment Variables
 
-1. **Connect your GitHub repo** to Railway
-2. **Configure environment variables**:
-   ```bash
-   RAILWAY_ENVIRONMENT=production
-   KEEP_ALIVE=true
-   MAX_WORKERS=5
-   EMAIL_NOTIFICATIONS=true
-   EMAIL_SMTP_SERVER=smtp.gmail.com
-   EMAIL_USERNAME=your_email@gmail.com
-   EMAIL_PASSWORD=your_app_password
-   EMAIL_RECIPIENTS=admin@example.com
-   ```
-3. **Deploy** from Railway dashboard
+### 🔑 Core / Deployment
+| Variable             | Description                                   | Default |
+|----------------------|-----------------------------------------------|---------|
+| `DEPLOYMENT_MODE`    | Enable enhanced deployment mode               | `true`  |
+| `KEEP_ALIVE`         | Keep container watchdog alive                 | `true`  |
+| `JOB_NAME`           | Job display name in logs                      | `Bulk API Trigger` |
+| `SKIP_ROWS`          | Skip initial rows in CSV                      | `0` |
+| `METRICS_ENABLED`    | Expose metrics on port `8000`                 | `true` |
+| `HEALTH_CHECK_ENABLED` | Enable health check server                  | `true` |
 
-## 📁 File Structure
+---
 
+### 👀 Watchdog (CSV Auto-detection)
+| Variable           | Description                                | Default |
+|--------------------|--------------------------------------------|---------|
+| `WATCHDOG_ENABLED` | Enable directory watcher                   | `true` |
+| `WATCH_PATHS`      | Comma-separated list of paths to monitor    | `/app/data/csv` |
+| `DEBOUNCE_DELAY`   | Seconds to wait before processing new file  | `3.0` |
+| `MAX_QUEUE_SIZE`   | Maximum number of queued jobs              | `100` |
+
+---
+
+### ⚡ Rate Limiting & Workers
+| Variable             | Description                                   | Default |
+|----------------------|-----------------------------------------------|---------|
+| `MAX_WORKERS`        | Number of parallel workers                    | `3` |
+| `BASE_RATE_LIMIT`    | Base requests/second                          | `3.0` |
+| `STARTING_RATE_LIMIT`| Initial requests/second                       | `3.0` |
+| `MAX_RATE_LIMIT`     | Maximum requests/second                       | `10.0` |
+| `WINDOW_SIZE`        | Sliding window size (seconds)                 | `20` |
+| `ERROR_THRESHOLD`    | Error ratio that triggers backoff             | `0.3` |
+
+---
+
+### 🔁 Retry & Timeout
+| Variable         | Description                       | Default |
+|------------------|-----------------------------------|---------|
+| `MAX_RETRIES`    | Max retry attempts per request    | `3` |
+| `REQUEST_TIMEOUT`| Timeout per request (seconds)     | `30` |
+
+---
+
+### 💾 Database
+| Variable           | Description                             | Default |
+|--------------------|-----------------------------------------|---------|
+| `DATABASE_ENABLED` | Enable SQLite DB storage                | `true` |
+| `DATABASE_PATH`    | Path to database file                   | `/app/data/webhook_results.db` |
+| `DATABASE_BACKUP`  | Enable automatic DB backups             | `true` |
+
+---
+
+### 📑 CSV Handling
+| Variable            | Description                           | Default |
+|---------------------|---------------------------------------|---------|
+| `ARCHIVE_PROCESSED` | Archive CSV after processing           | `true` |
+| `ARCHIVE_PATH`      | Path to store archived CSVs            | `/app/data/csv/processed` |
+| `CSV_FILE`          | File to process on startup (`AUTO` = scan folder) | `AUTO` |
+
+---
+
+### ✉️ Notifications – Email
+| Variable                  | Description                                | Default |
+|---------------------------|--------------------------------------------|---------|
+| `EMAIL_NOTIFICATIONS`     | Enable email notifications                 | `false` |
+| `EMAIL_SMTP_SERVER`       | SMTP server                                | `smtp.gmail.com` |
+| `EMAIL_SMTP_PORT`         | SMTP port                                  | `587` |
+| `EMAIL_USERNAME`          | SMTP username                              | — |
+| `EMAIL_PASSWORD`          | SMTP password (use App Password if Gmail)  | — |
+| `EMAIL_FROM`              | Sender email                               | — |
+| `EMAIL_RECIPIENTS`        | Comma-separated recipients                 | `ops@example.com` |
+| `EMAIL_NOTIFY_COMPLETION` | Send email on job completion               | `true` |
+| `EMAIL_NOTIFY_FILE_DETECTED` | Notify when file detected               | `false` |
+
+---
+
+### 💬 Notifications – Slack
+| Variable                  | Description                                | Default |
+|---------------------------|--------------------------------------------|---------|
+| `SLACK_NOTIFICATIONS`     | Enable Slack notifications                 | `false` |
+| `SLACK_WEBHOOK_URL`       | Slack webhook URL                          | — |
+| `SLACK_NOTIFY_COMPLETION` | Send Slack message on job completion       | `true` |
+| `SLACK_NOTIFY_FILE_DETECTED` | Notify when file detected               | `true` |
+
+---
+
+### 🐳 Platform Flags (auto-detected, optional)
+| Variable             | Description                      |
+|----------------------|----------------------------------|
+| `RAILWAY_ENVIRONMENT`| Auto-set if running on Railway   |
+| `DOCKER_CONTAINER`   | Auto-set if running in Docker    |
+
+---
+
+## 📦 Example `.env`
+
+```env
+DEPLOYMENT_MODE=true
+KEEP_ALIVE=true
+JOB_NAME=Bulk API Trigger
+WATCH_PATHS=/app/data/csv
+MAX_WORKERS=5
+BASE_RATE_LIMIT=5.0
+MAX_RATE_LIMIT=15.0
+DATABASE_ENABLED=true
+EMAIL_NOTIFICATIONS=true
+EMAIL_USERNAME=bot@example.com
+EMAIL_PASSWORD=xxxxxx
+EMAIL_FROM=bot@example.com
+EMAIL_RECIPIENTS=ops@example.com,dev@example.com
+SLACK_NOTIFICATIONS=true
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXXX/YYYY/ZZZZ
 ```
-bulk-api-trigger/
-├── webhook_trigger.py          # Main application
-├── requirements.txt            # Python dependencies
-├── Procfile                   # Process configuration
-├── Dockerfile                 # Docker configuration
-├── docker-compose.yml         # Docker Compose setup
-├── config.yaml               # Configuration file (optional)
-├── csv/                      # CSV files directory
-│   ├── webhooks.csv          # Main webhook file
-│   ├── http_triggers.csv     # Additional webhook file
-│   └── templates/            # CSV templates
-├── data/                     # Data directory
-│   └── webhook_results.db    # SQLite database
-├── logs/                     # Log files
-│   └── webhook_trigger.log   # Application logs
-└── docs/                     # Documentation
-    ├── CSV_TEMPLATES.md      # CSV format examples
-    └── API_EXAMPLES.md       # API integration examples
-```
-
-## 🔧 Configuration Options
-
-### Environment Variables (Priority: High)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DEPLOYMENT_MODE` | `false` | Enable deployment mode |
-| `KEEP_ALIVE` | `true` | Keep container running |
-| `JOB_NAME` | Auto-generated | Custom job name |
-| `MAX_WORKERS` | `3` | Parallel request limit |
-| `BASE_RATE_LIMIT` | `3.0` | Base delay between requests (seconds) |
-| `STARTING_RATE_LIMIT` | `3.0` | Initial rate limit |
-| `MAX_RATE_LIMIT` | `5.0` | Maximum rate limit |
-| `ERROR_THRESHOLD` | `0.3` | Error rate threshold (30%) |
-| `MAX_RETRIES` | `3` | Retry attempts per request |
-| `REQUEST_TIMEOUT` | `30` | Request timeout (seconds) |
-| `SKIP_ROWS` | `0` | Rows to skip in CSV |
-| `CSV_FILE` | `AUTO` | Specific CSV file or auto-discovery |
-
-### Notification Settings
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `EMAIL_NOTIFICATIONS` | `false` | Enable email notifications |
-| `EMAIL_SMTP_SERVER` | `smtp.gmail.com` | SMTP server |
-| `EMAIL_SMTP_PORT` | `587` | SMTP port |
-| `EMAIL_USERNAME` | - | Email username |
-| `EMAIL_PASSWORD` | - | Email password/app password |
-| `EMAIL_FROM` | - | From email address |
-| `EMAIL_RECIPIENTS` | - | Comma-separated recipient list |
-| `SLACK_NOTIFICATIONS` | `false` | Enable Slack notifications |
-| `SLACK_WEBHOOK_URL` | - | Slack webhook URL |
 
 ### Configuration File (config.yaml) - Priority: Medium
 
