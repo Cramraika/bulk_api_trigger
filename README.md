@@ -418,7 +418,7 @@ services:
 
 ```bash
 # Check if database is accessible
-python -c "import sqlite3; conn=sqlite3.connect('webhook_results.db'); print('DB OK'); conn.close()"
+python -c "import sqlite3; conn=sqlite3.connect('/data/webhook_results.db'); print('DB OK'); conn.close()"
 
 # Check CSV file validity
 python webhook_trigger.py your_file.csv --dry-run
