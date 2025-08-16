@@ -387,16 +387,20 @@ class DatabaseManager:
 
 class FileWatchdog(FileSystemEventHandler):
     """Enhanced file system watchdog for CSV monitoring"""
-    def __init__(self, job_queue: queue.Queue, db_manager: DatabaseManager, config: Dict,
-                 inflight_files: Set[str], inflight_lock: Lock):
+    def __init__(self, job_queue, db_manager, config,
+                 inflight_files=None, inflight_lock=None):
         super().__init__()
         self.job_queue = job_queue
         self.db_manager = db_manager
         self.config = config
-        self.inflight_files = inflight_files
-        self.inflight_lock = inflight_lock
+
+        # NEW: tolerate old call-sites
+        from threading import Lock
+        self.inflight_files = inflight_files if inflight_files is not None else set()
+        self.inflight_lock = inflight_lock if inflight_lock is not None else Lock()
+
+        self.processed_files: Set[str] = set()
         self.file_lock = Lock()
-        self.processed_files: Set[str] = set()  # (optional legacy; no longer used to dedupe)
         self._load_processed_files()
 
         
