@@ -1411,6 +1411,7 @@ class BulkAPITrigger:
         
         # Initialize file system observer
         self.observer = Observer()
+        
         event_handler = FileWatchdog(
             self.job_queue, self.db_manager, self.config,
             inflight_files=self.inflight_files, inflight_lock=self.inflight_lock
@@ -1429,65 +1430,65 @@ class BulkAPITrigger:
     
     def _process_queue_worker(self):
         """Background worker to process queued jobs"""
-    debounce_delay = self.config.get('watchdog', {}).get('debounce_delay', 3.0)
+        debounce_delay = self.config.get('watchdog', {}).get('debounce_delay', 3.0)
 
-    while not self.shutdown_event.is_set():
-        try:
-            job_info = self.job_queue.get(timeout=1.0)
+        while not self.shutdown_event.is_set():
             try:
-                logger.info(f"⏳ Debouncing file: {os.path.basename(job_info['csv_file'])} ({debounce_delay}s)")
-                time.sleep(debounce_delay)
-
-                # Missing file?
-                if not os.path.exists(job_info['csv_file']):
-                    logger.warning(f"File no longer exists: {job_info['csv_file']}")
-                    self.db_manager.update_file_status(job_info['csv_file'], 'failed')
-                    continue
-
-                # Changed during debounce? Requeue (keep inflight)
-                current_hash = self._calculate_file_hash(job_info['csv_file'])
-                if current_hash and current_hash != job_info['file_hash']:
-                    logger.info(f"File changed during debounce, re-queuing: {job_info['csv_file']}")
-                    job_info['file_hash'] = current_hash
-                    self.job_queue.put(job_info)
-                    continue
-
-                # Already completed?
-                if self.db_manager.is_file_processed(job_info['csv_file'], job_info['file_hash']):
-                    logger.info(f"File already processed: {os.path.basename(job_info['csv_file'])}")
-                    continue
-
-                # Optional: notify detected (if you prefer at worker time)
-                self.notification_manager.send_file_detected_notification(job_info)
-
-                # Processing start
-                job_name = f"Auto: {os.path.basename(job_info['csv_file'])}"
-                logger.info(f"🎬 Auto-processing file: {os.path.basename(job_info['csv_file'])}")
-                self.db_manager.update_file_status(job_info['csv_file'], 'processing')
-
+                job_info = self.job_queue.get(timeout=1.0)
                 try:
-                    job_id = self.trigger_webhooks(
-                        csv_files=[job_info['csv_file']],
-                        job_name=job_name,
-                        triggered_by='watchdog'
-                    )
-                    self.db_manager.update_file_status(job_info['csv_file'], 'completed', job_id)
-                    logger.info(f"✅ Auto-processing completed for: {os.path.basename(job_info['csv_file'])}")
-                except Exception as e:
-                    logger.error(f"❌ Auto-processing failed for {job_info['csv_file']}: {e}")
-                    self.db_manager.update_file_status(job_info['csv_file'], 'failed')
+                    logger.info(f"⏳ Debouncing file: {os.path.basename(job_info['csv_file'])} ({debounce_delay}s)")
+                    time.sleep(debounce_delay)
 
-            finally:
-                # ALWAYS release inflight + task_done
-                with self.inflight_lock:
-                    self.inflight_files.discard(job_info['csv_file'])
-                self.job_queue.task_done()
+                    # Missing file?
+                    if not os.path.exists(job_info['csv_file']):
+                        logger.warning(f"File no longer exists: {job_info['csv_file']}")
+                        self.db_manager.update_file_status(job_info['csv_file'], 'failed')
+                        continue
 
-        except queue.Empty:
-            continue
-        except Exception as e:
-            logger.error(f"Error in queue processing worker: {e}")
-            logger.error(traceback.format_exc())
+                    # Changed during debounce? Requeue (keep inflight)
+                    current_hash = self._calculate_file_hash(job_info['csv_file'])
+                    if current_hash and current_hash != job_info['file_hash']:
+                        logger.info(f"File changed during debounce, re-queuing: {job_info['csv_file']}")
+                        job_info['file_hash'] = current_hash
+                        self.job_queue.put(job_info)
+                        continue
+
+                    # Already completed?
+                    if self.db_manager.is_file_processed(job_info['csv_file'], job_info['file_hash']):
+                        logger.info(f"File already processed: {os.path.basename(job_info['csv_file'])}")
+                        continue
+
+                    # Optional: notify detected (if you prefer at worker time)
+                    self.notification_manager.send_file_detected_notification(job_info)
+
+                    # Processing start
+                    job_name = f"Auto: {os.path.basename(job_info['csv_file'])}"
+                    logger.info(f"🎬 Auto-processing file: {os.path.basename(job_info['csv_file'])}")
+                    self.db_manager.update_file_status(job_info['csv_file'], 'processing')
+
+                    try:
+                        job_id = self.trigger_webhooks(
+                            csv_files=[job_info['csv_file']],
+                            job_name=job_name,
+                            triggered_by='watchdog'
+                        )
+                        self.db_manager.update_file_status(job_info['csv_file'], 'completed', job_id)
+                        logger.info(f"✅ Auto-processing completed for: {os.path.basename(job_info['csv_file'])}")
+                    except Exception as e:
+                        logger.error(f"❌ Auto-processing failed for {job_info['csv_file']}: {e}")
+                        self.db_manager.update_file_status(job_info['csv_file'], 'failed')
+
+                finally:
+                    # ALWAYS release inflight + task_done
+                    with self.inflight_lock:
+                        self.inflight_files.discard(job_info['csv_file'])
+                    self.job_queue.task_done()
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error in queue processing worker: {e}")
+                logger.error(traceback.format_exc())
 
     
     def _calculate_file_hash(self, file_path: str) -> str:
