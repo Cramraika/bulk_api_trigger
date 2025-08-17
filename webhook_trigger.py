@@ -16,12 +16,14 @@ import sqlite3
 import hashlib
 import shutil
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+import heapq
 from threading import Lock, Semaphore, Event, Thread, Timer
 from tqdm import tqdm
 from typing import List, Dict, Optional, Tuple, Set
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import email.utils
 import smtplib
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -111,6 +113,15 @@ MAX_HEADER_SIZE = 10000
 MAX_HEADER_COUNT = 50
 HEARTBEAT_INTERVAL = 300  # 5 minutes
 
+# Global shutdown coordination
+SHUTDOWN_EVENT = Event()
+
+def _handle_sigterm(signum, frame):
+    logger.info("🛑 Received signal %s, shutting down gracefully...", signum)
+    SHUTDOWN_EVENT.set()
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
+signal.signal(signal.SIGINT, _handle_sigterm)
 # Keep stdout line-buffered in Docker-ish envs
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -123,6 +134,17 @@ def _to_float(v, default=0.0):
         return float(v) if v is not None else default
     except (TypeError, ValueError):
         return default
+
+SENSITIVE_HEADER_KEYS = {"authorization", "x-api-key", "api-key", "proxy-authorization", "authentication"}
+
+def _redact_headers(h: Dict[str, str]) -> Dict[str, str]:
+    redacted = {}
+    for k, v in (h or {}).items():
+        if k.lower() in SENSITIVE_HEADER_KEYS:
+            redacted[k] = "***REDACTED***"
+        else:
+            redacted[k] = v
+    return redacted
 
 def prune_old_reports(report_dir: str, keep: int = 200):
     try:
@@ -225,6 +247,88 @@ def _is_valid_url(u: str) -> bool:
         return False
 
 from requests.adapters import HTTPAdapter
+
+# ---- HTTP result classification & execution helpers ----
+from requests.exceptions import RequestException
+
+NON_RETRIABLE_STATUS = {400, 401, 403, 404, 405, 410, 413, 415, 422}
+
+def _parse_retry_after(resp: requests.Response) -> Optional[float]:
+    ra = resp.headers.get("Retry-After")
+    if not ra:
+        return None
+    try:
+        return float(ra)  # seconds
+    except ValueError:
+        try:
+            dt = email.utils.parsedate_to_datetime(ra)  # HTTP-date
+            return max(0.0, (dt - datetime.now(dt.tzinfo or timezone.utc)).total_seconds())
+        except Exception:
+            return None
+
+def do_request(row: Dict, attempt: int, timeout: float = 30.0) -> Dict:
+    url   = row['webhook_url']
+    meth  = (row.get('method') or 'GET').upper()
+    hdrs  = row.get('headers_sent') or {}
+    body  = row.get('payload')
+    session = get_http_session()
+
+    t0 = time.time()
+    code = None
+    resp_preview = ""
+    req_sz = len(json.dumps(body).encode("utf-8")) if isinstance(body, (dict, list)) else (len(body.encode("utf-8")) if isinstance(body, str) else 0)
+    try:
+        if meth in ("GET", "DELETE"):
+            resp = session.request(meth, url, headers=hdrs, timeout=timeout)
+        else:
+            if isinstance(body, (dict, list)):
+                resp = session.request(meth, url, headers=hdrs, json=body, timeout=timeout)
+            elif isinstance(body, str) and body:
+                resp = session.request(meth, url, headers=hdrs, data=body.encode("utf-8"), timeout=timeout)
+            else:
+                resp = session.request(meth, url, headers=hdrs, timeout=timeout)
+
+        code = resp.status_code
+        ok = 200 <= code < 300
+        resp_preview = (resp.text or "")[:1000]
+
+        retry_after = _parse_retry_after(resp) if code == 429 else None
+
+        return {
+            "url": url,
+            "method": meth,
+            "status": "success" if ok else "failed",
+            "status_code": code,
+            "response_time": time.time() - t0,
+            "timestamp": datetime.now().isoformat(),
+            "attempt": attempt,
+            "error_message": None,
+            "response_preview": resp_preview,
+            "request_size": req_sz,
+            "response_size": len(resp.content or b""),
+            "headers_sent": _redact_headers(hdrs),
+            "retry_after_seconds": retry_after,
+            "retriable": (code == 429) or (500 <= code < 600),
+            "permanent": (code in NON_RETRIABLE_STATUS),
+        }
+    except RequestException as e:
+        return {
+            "url": url,
+            "method": meth,
+            "status": "failed",
+            "status_code": None,
+            "response_time": time.time() - t0,
+            "timestamp": datetime.now().isoformat(),
+            "attempt": attempt,
+            "error_message": f"{type(e).__name__}: {e}",
+            "response_preview": resp_preview,
+            "request_size": req_sz,
+            "response_size": 0,
+            "headers_sent": _redact_headers(hdrs),
+            "retry_after_seconds": None,
+            "retriable": True,    # network errors are retriable by default
+            "permanent": False,
+        }
 
 def _create_http_session() -> requests.Session:
     s = requests.Session()
@@ -769,6 +873,8 @@ class EnhancedResultsTracker:
     def record(self, result: Dict):
         # persist row
         try:
+            if isinstance(result.get('headers_sent'), dict):
+                result['headers_sent'] = _redact_headers(result['headers_sent'])
             self.db.save_webhook_result(self.job_id, result)
         except Exception as e:
             logger.error(f"DB save failed: {e}")
@@ -885,21 +991,14 @@ def read_csv_with_validation(csv_path: str, chunk_size: int = 1000, skip_rows: i
                 if nrow.get('payload'):
                     ptxt = nrow['payload'].strip()
                     if ptxt:
-                        # Limit payload size to prevent memory issues
                         MAX_PAYLOAD_SIZE = int(os.getenv('MAX_PAYLOAD_SIZE_BYTES', '1048576'))  # 1MB default
                         if len(ptxt) > MAX_PAYLOAD_SIZE:
                             logger.warning(f"Payload too large for {url}, truncating from {len(ptxt)} to {MAX_PAYLOAD_SIZE} bytes")
                             ptxt = ptxt[:MAX_PAYLOAD_SIZE]
-                        
                         try:
                             payload = json.loads(ptxt)
                         except json.JSONDecodeError:
-                            # If it looks like JSON but is malformed, log warning but continue with text
-                            if ptxt.startswith(('{', '[')):
-                                logger.warning(f"Malformed JSON payload for {url}, sending as text: {ptxt[:100]}...")
-                            payload = ptxt  # send as-is (text)
-                        except Exception as e:
-                            logger.warning(f"Unexpected error parsing payload for {url}: {e}")
+                            # fallback: send as raw text for endpoints expecting non-JSON
                             payload = ptxt
 
                 webhooks.append({
@@ -1096,8 +1195,6 @@ def make_request(
                 'headers_sent': headers or {},
             }
             results_tracker.record(result_row)
-            rate_limiter.tick()
-            pbar.update(1)
 
             if ok:
                 error_code = 0
@@ -1544,21 +1641,25 @@ class BulkAPITrigger:
                 pbar = None
                 try:
                     pbar = tqdm(
-                            total=total_requests,
-                            desc="🌐 API Requests",
-                            dynamic_ncols=False,
-                            ascii=True,
-                            file=sys.stdout,
-                            mininterval=1.0,
-                            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
-                            disable=not (sys.stdout.isatty() or os.getenv("FORCE_TQDM","0") == "1")
-                        )
-                    
+                        total=total_requests,
+                        desc="🌐 API Requests",
+                        dynamic_ncols=False,
+                        ascii=True,
+                        file=sys.stdout,
+                        mininterval=1.0,
+                        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+                        disable=not (sys.stdout.isatty() or os.getenv("FORCE_TQDM","0") == "1")
+                    )
+
                     futures: Dict = {}
-                    new_futures_q: queue.Queue = queue.Queue()
-                    timers: List[Timer] = []
+
+                    # retry heap entries: (run_at_epoch, seq, webhook_dict, attempt_int, next_backoff_float)
+                    retry_heap: List[Tuple[float, int, Dict, int, float]] = []
+                    _seq = 0  # tie-breaker for heap
 
                     def _submit_now(webhook: Dict, attempt: int = 0, next_backoff: Optional[float] = None):
+                        if SHUTDOWN_EVENT.is_set():
+                            return None
                         fut = executor.submit(
                             make_request,
                             webhook['url'],
@@ -1576,90 +1677,74 @@ class BulkAPITrigger:
                             next_backoff
                         )
                         futures[fut] = webhook
+                        return fut
 
-                    def _schedule_retry(delay_s: float, webhook: Dict, attempt: int, next_backoff: float):
-                        # Use a Timer so we don't block any worker threads during the delay
-                        def _resubmit():
-                            try:
-                                fut = executor.submit(
-                                    make_request,
-                                    webhook['url'],
-                                    webhook['method'],
-                                    webhook['payload'],
-                                    webhook['header'],
-                                    self.config.get('retry', {}).get('max_retries', 3),
-                                    rate_limiter,
-                                    pbar,
-                                    results_tracker,
-                                    self.config.get('retry', {}).get('timeout', 30),
-                                    self.global_request_sema,
-                                    self.config.get('retry', {}).get('retry_delay', 1.0),
-                                    attempt,
-                                    next_backoff
-                                )
-                                new_futures_q.put((fut, webhook))
-                            except Exception as _e:
-                                logger.debug(f"Retry resubmission failed: {_e}")
-                        t = Timer(max(0.01, float(delay_s)), _resubmit)
-                        t.daemon = True
-                        t.start()
-                        timers.append(t)
-
-                    # Seed initial submissions
+                    # seed initial submissions
                     for webhook in all_webhooks:
                         _submit_now(webhook, attempt=0, next_backoff=None)
 
-                    # Process dynamically until all work (including scheduled retries) completes
-                    while futures or any(t.is_alive() for t in timers):
-                        # Merge any newly scheduled futures
-                        try:
-                            while True:
-                                fut, wh = new_futures_q.get_nowait()
-                                futures[fut] = wh
-                        except queue.Empty:
-                            pass
+                    # main loop: process completions and submit due retries
+                    while (futures or retry_heap) and not SHUTDOWN_EVENT.is_set():
+                        # submit any due retries
+                        now = time.time()
+                        while retry_heap and retry_heap[0][0] <= now and not SHUTDOWN_EVENT.is_set():
+                            _, _, wh, att, nb = heapq.heappop(retry_heap)
+                            _submit_now(wh, attempt=att, next_backoff=nb)
 
                         if not futures:
-                            time.sleep(0.05)
+                            # nothing in flight; sleep until next retry due or exit
+                            sleep_for = max(0.05, (retry_heap[0][0] - time.time()) if retry_heap else 0.1)
+                            time.sleep(min(0.5, sleep_for))
                             continue
 
-                        # Wait for at least one completion among current futures
-                        for future in as_completed(list(futures.keys()), timeout=0.5):
+                        done, _ = wait(list(futures.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
+                        if not done:
+                            continue
+
+                        for future in done:
                             webhook = futures.pop(future)
                             try:
                                 result = future.result()
-                                # Retry signal returns a dict with _retry_in
-                                if isinstance(result, dict) and result.get('_retry_in') is not None:
+                                # contract: dict with `_retry_in` means retryable transient
+                                if isinstance(result, dict) and (result.get('_retry_in') is not None):
                                     delay = float(result.get('_retry_in', 0.0))
                                     attempt_val = int(result.get('attempt', 0))
                                     next_backoff = float(result.get('_next_backoff', self.config.get('retry', {}).get('retry_delay', 1.0)))
+                                    max_retries_cfg = int(self.config.get('retry', {}).get('max_retries', 3))
 
-                                    if attempt_val < self.config.get('retry', {}).get('max_retries', 3):
-                                        # Schedule re-submission later (non-blocking)
-                                        _schedule_retry(delay, webhook, attempt_val, next_backoff)
+                                    if attempt_val < max_retries_cfg and not SHUTDOWN_EVENT.is_set():
+                                        _seq += 1
+                                        heapq.heappush(retry_heap, (time.time() + max(0.0, delay), _seq, webhook, attempt_val, next_backoff))
                                     else:
-                                        # Out of retries: count as failure
+                                        # exhausted retries — finalize as failure
                                         error_window.append(1)
                                         window_size = min(rate_config.get('window_size', 20), MAX_ERROR_WINDOW)
                                         if len(error_window) > window_size:
-                                            error_window = error_window[-window_size:]
+                                            error_window[:] = error_window[-window_size:]
                                         processed_count += 1
                                         failed_count += 1
-                                    break  # Rebuild the as_completed set to notice newly added futures
+                                        if pbar:
+                                            pbar.update(1)
+                                    continue  # handle next completed future
 
-                                # Normal int result path
+                                # normal path: result is an int error flag
                                 error = int(result)
                                 error_window.append(error)
                                 window_size = min(rate_config.get('window_size', 20), MAX_ERROR_WINDOW)
                                 if len(error_window) > window_size:
-                                    error_window = error_window[-window_size:]
+                                    error_window[:] = error_window[-window_size:]
+
                                 processed_count += 1
                                 if error == 0:
                                     successful_count += 1
                                 else:
                                     failed_count += 1
 
-                                # -------- Logger progress every PROGRESS_EVERY_N --------
+                                if pbar:
+                                    pbar.update(1)
+                                rate_limiter.tick()
+
+                                # periodic progress logging
                                 PROGRESS_EVERY_N = int(os.getenv("PROGRESS_EVERY_N", "50"))
                                 if processed_count % PROGRESS_EVERY_N == 0:
                                     success_rate = (successful_count / max(1, processed_count)) * 100
@@ -1669,7 +1754,7 @@ class BulkAPITrigger:
                                         f"({success_rate:.1f}% success, {throughput:.2f} req/s)"
                                     )
 
-                                # -------- Slack progress: independent of success/failure --------
+                                # optional slack progress
                                 if (
                                     self.notification_manager.slack_config.get('enabled')
                                     and os.getenv("SLACK_NOTIFY_PROGRESS", "false").lower() == "true"
@@ -1679,7 +1764,6 @@ class BulkAPITrigger:
                                         urgency = os.getenv("SLACK_PROGRESS_URGENCY", "auto")
                                         if urgency == "auto":
                                             urgency = _slack_urgency_for_progress(successful_count, processed_count)
-
                                         msg = (
                                             f"⏳ *{job_name}* in progress\n"
                                             f"{processed_count}/{total_requests} processed\n"
@@ -1690,26 +1774,26 @@ class BulkAPITrigger:
                                             self.notification_manager.send_slack_notification(msg, urgency)
                                         except Exception as _e:
                                             logger.debug(f"Progress Slack suppressed: {type(_e).__name__}: {_e}")
+
                             except Exception as e:
                                 logger.error(f"💥 Failed processing {webhook['url']}: {e}")
                                 failed_count += 1
                                 processed_count += 1
+                                if pbar:
+                                    pbar.update(1)
 
-                            # -------- Dynamic rate adjustment (your fixed direction) --------
+                            # dynamic rate adjustment on a sliding window
                             if processed_count % rate_config.get('window_size', 20) == 0 and error_window:
                                 error_rate = sum(error_window) / len(error_window)
                                 current_rate = rate_limiter.get_rate()
                                 if error_rate > rate_config.get('error_threshold', 0.3):
                                     new_rate = max(self.config.get('rate_limiting', {}).get('base_rate_limit', 3.0),
-                                                   current_rate / 1.2)
+                                                current_rate / 1.2)
                                     rate_limiter.adjust_rate(new_rate)
                                 elif error_rate < rate_config.get('error_threshold', 0.3) / 2:
                                     new_rate = min(self.config.get('rate_limiting', {}).get('max_rate_limit', 5.0),
-                                                   current_rate * 1.2)
+                                                current_rate * 1.2)
                                     rate_limiter.adjust_rate(new_rate)
-
-                            break # Break inner for-loop to refresh the as_completed set
-
                 finally:
                     if pbar:
                         try:
