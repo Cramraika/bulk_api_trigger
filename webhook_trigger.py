@@ -1375,23 +1375,37 @@ class FileWatchdog(FileSystemEventHandler):
 
             initial_size = os.path.getsize(file_path)
             if initial_size == 0:
-                logger.warning(f"File {file_path} is empty")
+                # Give the writer time to actually write data
+                debounce = float(self.config.get('watchdog', {}).get('debounce_delay', 3.0))
                 try:
-                    if self.config.get('csv', {}).get('archive_on_validation_failure', True):
-                        move_file_reasoned(
-                            file_path,
-                            self.config.get('csv', {}).get('rejected_path', ''),
-                            reason_prefix="invalid_empty-file_"
-                        )
-                except Exception:
-                    pass
-                try:
-                    fh = self._calculate_file_hash(file_path)
-                    self.db_manager.track_file(file_path, fh or '', 0, rows_count=0)
-                    self.db_manager.update_file_status(file_path, 'rejected_empty_file')
-                except Exception:
-                    pass
-                return False
+                    time.sleep(max(0.5, min(10.0, debounce)))  # clamp 0.5..10s
+                    # re-stat after wait
+                    size_after_wait = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+                except Exception as _e:
+                    logger.debug(f"Empty-file recheck failed: {_e}")
+                    return False  # let the next file event try again
+
+                if size_after_wait == 0:
+                    # STILL empty after patience window — treat as invalid and (optionally) move
+                    logger.warning(f"File {file_path} is empty after debounce")
+                    try:
+                        if self.config.get('csv', {}).get('archive_on_validation_failure', True):
+                            move_file_reasoned(
+                                file_path,
+                                self.config.get('csv', {}).get('rejected_path', ''),
+                                reason_prefix="invalid_empty-file_"
+                            )
+                    except Exception as _e:
+                        logger.debug(f"Archive on empty-file failure skipped: {_e}")
+                    # Record in DB for visibility (optional but useful)
+                    try:
+                        fh = self._calculate_file_hash(file_path)
+                        fs = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+                        self.db_manager.track_file(file_path, fh or '', fs, rows_count=0)
+                        self.db_manager.update_file_status(file_path, 'rejected_empty_file')
+                    except Exception as _e:
+                        logger.debug(f"DB status update for empty file failed: {_e}")
+                    return False
             # Adaptive delay based on file size, with reasonable bounds
             delay = min(3.0, max(0.5, initial_size / (1024 * 1024)))  # 0.5s to 3s based on MB
             time.sleep(delay)
