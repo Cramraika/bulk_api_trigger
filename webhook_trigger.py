@@ -8,26 +8,25 @@ import time
 import argparse
 import sys
 import os
+import random
 import glob
 import logging
 import yaml
 import sqlite3
 import hashlib
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock, Semaphore, Event, Thread
+from threading import Lock, Semaphore, Event, Thread, Timer
 from tqdm import tqdm
 from typing import List, Dict, Optional, Tuple, Set
-import schedule
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import smtplib
-from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import queue
-import re
+import signal
 import traceback
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
@@ -37,6 +36,13 @@ def setup_logging():
     """Setup enhanced logging with rotation (robust, UTF-8, single-init, flush on exit)."""
     import atexit
     from logging.handlers import RotatingFileHandler
+    
+    # Global module-level guard to prevent any possibility of duplicate setup
+    global _logging_initialized
+    if '_logging_initialized' in globals() and _logging_initialized:
+        return logging.getLogger(__name__)
+    
+    globals()['_logging_initialized'] = True
 
     # Avoid duplicate handlers if setup_logging() is ever called twice.
     root_logger = logging.getLogger()
@@ -98,6 +104,13 @@ def setup_logging():
 
 logger = setup_logging()
 
+# Constants
+DEFAULT_DEBOUNCE_DELAY = 3.0
+MAX_BACKOFF_SECONDS = 30.0
+MAX_HEADER_SIZE = 10000
+MAX_HEADER_COUNT = 50
+HEARTBEAT_INTERVAL = 300  # 5 minutes
+
 # Keep stdout line-buffered in Docker-ish envs
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -107,9 +120,32 @@ except Exception:
 # ---------- Small utils ----------
 def _to_float(v, default=0.0):
     try:
-        return float(v)
+        return float(v) if v is not None else default
     except (TypeError, ValueError):
         return default
+
+def prune_old_reports(report_dir: str, keep: int = 200):
+    try:
+        if not os.path.exists(report_dir):
+            logger.debug(f"Report directory does not exist: {report_dir}")
+            return
+        files = sorted(
+            [os.path.join(report_dir, f) for f in os.listdir(report_dir) if f.startswith('job_') and f.endswith('.json')],
+            key=os.path.getmtime,
+            reverse=True
+        )
+        removed_count = 0
+        for f in files[keep:]:
+            try:
+                os.remove(f)
+                removed_count += 1
+            except Exception as e:
+                logger.warning(f"Could not remove old report {f}: {e}")
+        if removed_count > 0:
+            logger.debug(f"Pruned {removed_count} old reports from {report_dir}")
+    except Exception as e:
+        logger.debug(f"Report pruning skipped: {e}")
+
 
 def _count_csv_rows(file_path: str) -> int:
     """Count non-header rows (with any value in webhook_url), respecting encoding/delimiter."""
@@ -125,8 +161,9 @@ def _count_csv_rows(file_path: str) -> int:
             name_map = {orig: norm for orig, norm in zip(raw_headers, headers)}
             count = 0
             for row in reader:
-                nrow = {name_map.get(k, (k or '')).lower(): (v or '').strip() for k, v in row.items()}
-                if nrow.get('webhook_url'):
+                nrow = {name_map.get(k, k or ''): (v or '').strip() for k, v in row.items()}
+                u = nrow.get('webhook_url')
+                if u and _is_valid_url(u):
                     count += 1
             return count
     except Exception:
@@ -136,7 +173,7 @@ def _slack_urgency_for_progress(successful_count: int, processed_count: int) -> 
     """Pick a Slack urgency based on live success rate."""
     if processed_count <= 0:
         return "normal"
-    rate = successful_count / processed_count
+    rate = max(0.0, min(1.0, successful_count / max(1, processed_count)))  # Prevent division by zero and bound rate
     if rate >= 0.98:
         return "low"
     if rate >= 0.90:
@@ -176,6 +213,35 @@ def _normalize_headers(raw_headers):
     """Normalize CSV headers by stripping BOM, trimming, lowercase"""
     return [ (h or '').lstrip('\ufeff').strip().lower() for h in (raw_headers or []) ]
 
+from urllib.parse import urlparse
+
+def _is_valid_url(u: str) -> bool:
+    try:
+        if not u:
+            return False
+        p = urlparse(u.strip())
+        return p.scheme in ('http', 'https') and bool(p.netloc)
+    except Exception:
+        return False
+
+from requests.adapters import HTTPAdapter
+
+def _create_http_session() -> requests.Session:
+    s = requests.Session()
+    pool = max(1, int(os.getenv('HTTP_POOL_MAXSIZE', '16') or '16'))
+    adapter = HTTPAdapter(pool_connections=pool, pool_maxsize=pool, max_retries=0)
+    s.mount('http://', adapter)
+    s.mount('https://', adapter)
+    return s
+
+import threading
+_HTTP_LOCAL = threading.local()
+
+def get_http_session():
+    """Get thread-local HTTP session"""
+    if not hasattr(_HTTP_LOCAL, 'session'):
+        _HTTP_LOCAL.session = _create_http_session()
+    return _HTTP_LOCAL.session
 
 # =========================
 # Database
@@ -191,13 +257,28 @@ class DatabaseManager:
     def get_connection(self):
         """Thread-safe database connection context manager"""
         with self._connection_lock:
-            conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
+            conn = None
             try:
+                conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
                 conn.execute("PRAGMA journal_mode=WAL;")
                 conn.execute("PRAGMA synchronous=NORMAL;")
+                # Test connection
+                conn.execute("SELECT 1")
                 yield conn
+            except Exception as e:
+                logger.error(f"Database connection error: {e}")
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                raise
             finally:
-                conn.close()
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception as e:
+                        logger.error(f"Error closing database connection: {e}")
 
     def init_database(self):
         with self.get_connection() as conn:
@@ -319,26 +400,50 @@ class DatabaseManager:
     def finish_job(self, job_id: str, successful: int, failed: int):
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                SELECT AVG(response_time) 
-                FROM webhook_results 
-                WHERE job_id = ? AND response_time IS NOT NULL
-            ''', (job_id,))
-            avg_response_time = cursor.fetchone()[0] or 0
-            cursor.execute('SELECT start_time FROM job_history WHERE job_id = ?', (job_id,))
-            result = cursor.fetchone()
-            if result:
-                start_time = datetime.fromisoformat(result[0])
-                duration = (datetime.now() - start_time).total_seconds()
-            else:
-                duration = 0
-            cursor.execute('''
-                UPDATE job_history 
-                SET successful_requests = ?, failed_requests = ?, end_time = ?, 
-                    duration_seconds = ?, status = 'completed', average_response_time = ?
-                WHERE job_id = ?
-            ''', (successful, failed, datetime.now().isoformat(), duration, avg_response_time, job_id))
-            conn.commit()
+            try:
+                # Calculate average response time
+                cursor.execute('''
+                    SELECT AVG(response_time) 
+                    FROM webhook_results 
+                    WHERE job_id = ? AND response_time IS NOT NULL
+                ''', (job_id,))
+                result = cursor.fetchone()
+                avg_response_time = result[0] if result and result[0] is not None else 0
+                
+                # Calculate duration from start time
+                cursor.execute('SELECT start_time FROM job_history WHERE job_id = ?', (job_id,))
+                result = cursor.fetchone()
+                if result:
+                    try:
+                        start_time = datetime.fromisoformat(result[0])
+                        duration = max(0, (datetime.now() - start_time).total_seconds())
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid start_time format for job {job_id}, using 0 duration")
+                        duration = 0
+                else:
+                    duration = 0
+                    
+                # Update job record
+                cursor.execute('''
+                    UPDATE job_history 
+                    SET successful_requests = ?, failed_requests = ?, end_time = ?, 
+                        duration_seconds = ?, status = 'completed', average_response_time = ?
+                    WHERE job_id = ?
+                ''', (successful, failed, datetime.now().isoformat(), duration, avg_response_time, job_id))
+                conn.commit()
+            except sqlite3.Error as e:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                logger.error(f"Database error finishing job {job_id}: {e}")
+                raise
+            except (ValueError, TypeError) as e:
+                logger.error(f"Data error finishing job {job_id}: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error finishing job {job_id}: {e}")
+                raise
 
     def track_file(self, file_path: str, file_hash: str, file_size: int, rows_count: int = 0):
         with self.get_connection() as conn:
@@ -354,10 +459,12 @@ class DatabaseManager:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT COUNT(*) FROM file_tracking 
+                SELECT 1 FROM file_tracking 
                 WHERE file_path = ? AND file_hash = ? AND status = 'completed'
+                LIMIT 1
             ''', (file_path, file_hash))
-            return cursor.fetchone()[0] > 0
+            row = cursor.fetchone()
+            return bool(row)
 
     def update_file_status(self, file_path: str, status: str, job_id: str = None):
         with self.get_connection() as conn:
@@ -411,8 +518,8 @@ class DatabaseManager:
                     'average_response_time': 0.0,
                     'status_breakdown': status_stats,
                 }
-            duration = _to_float(job[8], 0.0)
-            avg_response_time = _to_float(job[12], 0.0) if len(job) > 12 else 0.0
+            duration = _to_float(job[8] if len(job) > 8 else 0, 0.0)
+            avg_response_time = _to_float(job[12] if len(job) > 12 else 0, 0.0)
             return {
                 'job_id': job[0],
                 'job_name': job[1],
@@ -445,9 +552,38 @@ class NotificationManager:
         self.email_config = config.get('email', {})
         self.slack_config = config.get('slack', {})
 
+    @staticmethod
+    def send_startup_test_notifications(trigger: "BulkAPITrigger"):
+        try:
+            if os.getenv("SEND_TEST_NOTIFICATIONS_ON_STARTUP", "false").lower() != "true":
+                return
+            nm = trigger.notification_manager
+            if nm.slack_config.get('enabled'):
+                nm.send_slack_notification("✅ Test Slack from Bulk API Trigger (startup)", "low")
+            if nm.email_config.get('enabled') and nm.email_config.get('recipients'):
+                nm.send_email_notification(
+                    subject="✅ Test Email from Bulk API Trigger (startup)",
+                    body="<p>This is a startup test notification.</p>",
+                    to_emails=nm.email_config.get('recipients', [])
+                )
+            logger.info("🧪 Startup test notifications attempted")
+        except Exception as e:
+            logger.error(f"Startup test notifications failed: {e}")
+
     def send_email_notification(self, subject: str, body: str, to_emails: List[str]):
         if not self.email_config.get('enabled', False):
             logger.debug("Email notifications disabled in config; skipping send")
+            return
+        
+        # Validate required configuration
+        required_fields = ['smtp_server', 'username', 'password', 'from_email']
+        missing_fields = [field for field in required_fields if not self.email_config.get(field)]
+        if missing_fields:
+            logger.error(f"Email configuration missing required fields: {missing_fields}")
+            return
+        
+        if not to_emails:
+            logger.warning("No email recipients specified")
             return
         max_retries = 3
         for attempt in range(max_retries):
@@ -473,7 +609,7 @@ class NotificationManager:
                 server.quit()
                 logger.info(f"📧 Email notification sent to {to_emails}")
                 break
-            except Exception as e:
+            except (smtplib.SMTPException, OSError) as e:
                 logger.error(f"Failed to send email notification (attempt {attempt + 1}): {e}")
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
@@ -482,24 +618,38 @@ class NotificationManager:
         if not self.slack_config.get('enabled', False):
             logger.debug("Slack notifications disabled in config; skipping send")
             return
-        try:
-            emoji_map = {'low': '🔵','normal': '🟢','high': '🟡','critical': '🔴'}
-            payload = {
-                'text': f"{emoji_map.get(urgency, '🟢')} {message}",
-                'username': 'Bulk API Trigger Bot',
-                'icon_emoji': ':robot_face:',
-                'attachments': [{
-                    'color': 'good' if urgency in ['low', 'normal'] else ('warning' if urgency == 'high' else 'danger'),
-                    'ts': int(time.time())
-                }]
-            }
-            resp = requests.post(self.slack_config.get('webhook_url', ''), json=payload, timeout=10)
-            if resp.status_code == 200:
-                logger.info("📱 Slack notification sent successfully")
-            else:
-                logger.error(f"Failed to send Slack notification: {resp.status_code}")
-        except Exception as e:
-            logger.error(f"Failed to send Slack notification: {e}")
+        emoji_map = {'low': '🔵','normal': '🟢','high': '🟡','critical': '🔴'}
+        payload = {
+            'text': f"{emoji_map.get(urgency, '🟢')} {message}",
+            'username': 'Bulk API Trigger Bot',
+            'icon_emoji': ':robot_face:',
+            'attachments': [{
+                'color': 'good' if urgency in ['low', 'normal'] else ('warning' if urgency == 'high' else 'danger'),
+                'ts': int(time.time())
+            }]
+        }
+        url = self.slack_config.get('webhook_url', '')
+        if not url:
+            logger.error("Slack webhook URL not configured")
+            return
+            
+        max_attempts = 3
+        delay = 1.0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                http_session = get_http_session()
+                resp = http_session.post(url, json=payload, timeout=10)
+                if resp.status_code == 200:
+                    logger.info("📱 Slack notification sent successfully")
+                    return
+                logger.error(f"Failed to send Slack notification: HTTP {resp.status_code} (attempt {attempt}/{max_attempts})")
+            except requests.RequestException as e:
+                logger.error(f"Slack send exception (attempt {attempt}/{max_attempts}): {e}")
+
+            if attempt < max_attempts:
+                time.sleep(delay)
+                delay = min(8.0, delay * 2)
+
 
     def send_job_completion_notification(self, job_stats: Dict):
         total = job_stats.get('total_requests') or 0
@@ -519,7 +669,8 @@ class NotificationManager:
             )
             self.send_slack_notification(slack_message, urgency)
         if self.email_config.get('enabled') and self.email_config.get('notify_on_completion', True):
-            subject = f"Bulk API Job {'Completed' if success_rate > 0 else 'Failed'}: {job_stats.get('job_name','')}"
+            status_word = ("Completed" if succ == total else ("Completed (with failures)" if succ > 0 else "Failed"))
+            subject = f"Bulk API Job {status_word}: {job_stats.get('job_name','')}"
             html_body = f"""
             <h2>🚀 Job Completion Report</h2>
             <table border="1" cellpadding="10" style="border-collapse: collapse;">
@@ -588,11 +739,16 @@ class RateLimiter:
 
     def sleep_if_needed(self):
         """Crude pacing to avoid too-aggressive bursts."""
-        target_interval = 1.0 / max(0.1, self.get_rate())  # seconds between starts
+        current_rate = self.get_rate()
+        if current_rate <= 0:
+            return
+        target_interval = 1.0 / max(0.1, current_rate)  # seconds between starts
         now = time.time()
         since = now - self._last_tick
-        if since < target_interval:
-            time.sleep(target_interval - since)
+        if since < target_interval and since >= 0:
+            sleep_time = target_interval - since
+            if sleep_time > 0:
+                time.sleep(min(sleep_time, 60.0))  # Cap sleep to prevent infinite waits
         self._last_tick = time.time()
 
 
@@ -632,17 +788,6 @@ class EnhancedResultsTracker:
         return dict(self._metrics)
 
 
-def _slack_urgency_for_progress(successful_count: int, processed_count: int) -> str:
-    if processed_count <= 0:
-        return 'normal'
-    fail_rate = 1.0 - (successful_count / processed_count)
-    if fail_rate >= 0.4:
-        return 'critical'
-    if fail_rate >= 0.2:
-        return 'high'
-    return 'normal'
-
-
 # =========================
 # CSV reading & request execution
 # =========================
@@ -657,59 +802,121 @@ def read_csv_with_validation(csv_path: str, chunk_size: int = 1000, skip_rows: i
         'skipped_rows': max(0, int(skip_rows)),
     }
     enc = _detect_encoding(csv_path)
-    with open(csv_path, 'r', encoding=enc, newline='') as f:
-        delim = _detect_delimiter(f)
-        reader = csv.DictReader(f, delimiter=delim)
-        raw_headers = reader.fieldnames or []
-        headers = _normalize_headers(raw_headers)
-        req = [h.strip().lower() for h in os.getenv('CSV_REQUIRED_COLUMNS', 'webhook_url').split(',') if h.strip()]
-        missing = [h for h in req if h not in headers]
-        if missing:
-            raise ValueError(f"{csv_path}: missing required column(s): {missing} (headers={headers})")
-        # map original->normalized
-        name_map = {orig: norm for orig, norm in zip(raw_headers, headers)}
-        row_index = -1
-        for row in reader:
-            row_index += 1
-            if row_index < skip_rows:
-                continue
-            nrow = {name_map.get(k, (k or '')).lower(): (v or '').strip() for k, v in row.items()}
-            url = nrow.get('webhook_url', '')
-            if not url:
-                stats['invalid_rows'] += 1
-                continue
-            method = (nrow.get('method') or 'GET').upper()
-            headers_sent = {}
-            if nrow.get('header'):
-                try:
-                    headers_sent = json.loads(nrow['header'])
-                except Exception:
-                    # allow semi-colon separated "Key:Value" if json not provided
+
+    try:
+        with open(csv_path, 'r', encoding=enc, newline='') as f:
+            delim = _detect_delimiter(f)
+            reader = csv.DictReader(f, delimiter=delim)
+
+            raw_headers = reader.fieldnames or []
+            headers = _normalize_headers(raw_headers)
+
+            # validate required columns
+            req = [h.strip().lower() for h in os.getenv('CSV_REQUIRED_COLUMNS', 'webhook_url').split(',') if h.strip()]
+            missing = [h for h in req if h not in headers]
+            if missing:
+                raise ValueError(f"{csv_path}: missing required column(s): {missing} (headers={headers})")
+
+            # map original->normalized
+            name_map = {orig: norm for orig, norm in zip(raw_headers, headers)}
+            row_index = -1
+
+            for row in reader:
+                row_index += 1
+                if row_index < skip_rows:
+                    continue
+
+                nrow = {name_map.get(k, k or ''): (v or '').strip() for k, v in row.items()}
+                url = nrow.get('webhook_url', '').strip()
+                if not url:
+                    stats['invalid_rows'] += 1
+                    continue
+                if not _is_valid_url(url):
+                    # Try to normalize by adding scheme only if missing
+                    if not url.startswith(('http://', 'https://')):
+                        candidate = 'https://' + url
+                        if _is_valid_url(candidate):
+                            url = candidate
+                        else:
+                            stats['invalid_rows'] += 1
+                            continue
+                    else:
+                        stats['invalid_rows'] += 1
+                        continue
+                nrow['webhook_url'] = url
+
+                method = (nrow.get('method') or 'GET').upper()
+
+                headers_sent = {}
+                if nrow.get('header'):
+                    header_text = nrow['header']
+                    if len(header_text) > MAX_HEADER_SIZE:  # Limit header size
+                        logger.warning(f"Header too large for URL {url}, truncating")
+                        header_text = header_text[:MAX_HEADER_SIZE]
                     try:
-                        for part in nrow['header'].split(';'):
-                            if ':' in part:
-                                k, v = part.split(':', 1)
-                                headers_sent[k.strip()] = v.strip()
+                        headers_sent = json.loads(header_text)
+                        if isinstance(headers_sent, dict):
+                            validated_headers = {}
+                            for k, v in list(headers_sent.items())[:MAX_HEADER_COUNT]:
+                                if isinstance(k, str) and isinstance(v, (str, int, float)):
+                                    k_clean = ''.join(c for c in str(k).strip() if c.isprintable() and c not in '\r\n')
+                                    v_clean = ''.join(c for c in str(v).strip() if c.isprintable() and c not in '\r\n')
+                                    if k_clean and len(k_clean) <= 100 and len(v_clean) <= 1000:
+                                        validated_headers[k_clean] = v_clean
+                            headers_sent = validated_headers
+                        else:
+                            headers_sent = {}
                     except Exception:
-                        pass
-            payload = None
-            if nrow.get('payload'):
-                ptxt = nrow['payload']
-                try:
-                    payload = json.loads(ptxt)
-                except Exception:
-                    payload = ptxt  # send as-is (text)
-            webhooks.append({
-                'url': url,
-                'method': method,
-                'payload': payload,
-                'header': headers_sent,
-                'name': nrow.get('name') or url,
-                'group': nrow.get('group') or ''
-            })
-            stats['valid_rows'] += 1
+                        headers_sent = {}
+                        try:
+                            parts = header_text.split(';')[:MAX_HEADER_COUNT]
+                            for part in parts:
+                                if ':' in part:
+                                    k, v = part.split(':', 1)
+                                    k_clean = ''.join(c for c in k.strip() if c.isprintable() and c not in '\r\n')
+                                    v_clean = ''.join(c for c in v.strip() if c.isprintable() and c not in '\r\n')
+                                    if k_clean and len(k_clean) <= 100 and len(v_clean) <= 1000:
+                                        headers_sent[k_clean] = v_clean
+                        except Exception:
+                            pass
+
+
+                payload = None
+                if nrow.get('payload'):
+                    ptxt = nrow['payload'].strip()
+                    if ptxt:
+                        # Limit payload size to prevent memory issues
+                        MAX_PAYLOAD_SIZE = int(os.getenv('MAX_PAYLOAD_SIZE_BYTES', '1048576'))  # 1MB default
+                        if len(ptxt) > MAX_PAYLOAD_SIZE:
+                            logger.warning(f"Payload too large for {url}, truncating from {len(ptxt)} to {MAX_PAYLOAD_SIZE} bytes")
+                            ptxt = ptxt[:MAX_PAYLOAD_SIZE]
+                        
+                        try:
+                            payload = json.loads(ptxt)
+                        except json.JSONDecodeError:
+                            # If it looks like JSON but is malformed, log warning but continue with text
+                            if ptxt.startswith(('{', '[')):
+                                logger.warning(f"Malformed JSON payload for {url}, sending as text: {ptxt[:100]}...")
+                            payload = ptxt  # send as-is (text)
+                        except Exception as e:
+                            logger.warning(f"Unexpected error parsing payload for {url}: {e}")
+                            payload = ptxt
+
+                webhooks.append({
+                    'url': url,
+                    'method': method,
+                    'payload': payload,
+                    'header': headers_sent,
+                    'name': nrow.get('name') or url,
+                    'group': nrow.get('group') or ''
+                })
+                stats['valid_rows'] += 1
+
+    except IOError as e:
+        raise ValueError(f"Cannot read CSV file {csv_path}: {e}")
 
     return webhooks, stats
+
 
 
 def read_multiple_csv_files(file_patterns: List[str] = None, chunk_size: int = 1000, skip_rows: int = 0):
@@ -782,7 +989,8 @@ def _parse_retry_after_seconds(header_value: str, default: float) -> float:
         from email.utils import parsedate_to_datetime
         dt = parsedate_to_datetime(header_value)
         if dt:
-            delay = (dt - datetime.utcnow().replace(tzinfo=dt.tzinfo)).total_seconds()
+            now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.utcnow()
+            delay = (dt - now).total_seconds()
             return max(default, delay)
     except Exception:
         pass
@@ -801,24 +1009,35 @@ def make_request(
     timeout: int,
     global_request_sema: Optional[Semaphore] = None,
     retry_delay: float = 1.0,
+    attempt_start: int = 0,
+    backoff_override: Optional[float] = None,
 ) -> int:
     """
     Executes one HTTP request with basic retry/backoff.
     Returns 0 on success, 1 on error (for moving average error window).
     """
-    attempt = 0
+    attempt = int(attempt_start or 0)
     # Base backoff (from env), minimum 0.1s to avoid hot loops if user sets 0
     base_backoff = max(0.1, float(retry_delay or 0.0))
-    backoff = base_backoff
-    MAX_BACKOFF = 30.0  # keep your existing cap
+    backoff = backoff_override if backoff_override is not None else base_backoff
     error_code = 1  # assume failure until success
 
     while attempt <= max_retries:
         attempt += 1
+        acquired = False
         if global_request_sema:
             global_request_sema.acquire()
+            acquired = True
+
         try:
             rate_limiter.sleep_if_needed()
+            timeout = max(1, int(timeout or 0))
+            # Optional connect/read split via env (keeps old behavior if unset)
+            try:
+                ct_env = int(os.getenv('REQUEST_CONNECT_TIMEOUT', '0') or '0')
+            except Exception:
+                ct_env = 0
+            req_timeout = (min(ct_env, timeout), timeout) if ct_env > 0 else timeout
             started = time.time()
             method_u = (method or 'GET').upper()
             req_size = 0
@@ -828,29 +1047,37 @@ def make_request(
                 if isinstance(payload, (dict, list)):
                     data = json.dumps(payload)
                     req_size = len(data.encode('utf-8'))
-                    resp = requests.request(
+                    http_session = get_http_session()
+                    resp = http_session.request(
                         method_u, url, data=data,
                         headers={'Content-Type': 'application/json', **(headers or {})},
-                        timeout=timeout
+                        timeout=req_timeout
                     )
                 elif payload is not None:
-                    req_size = len(str(payload).encode('utf-8'))
-                    resp = requests.request(
-                        method_u, url, data=str(payload),
-                        headers=headers or {}, timeout=timeout
+                    data = str(payload)
+                    req_size = len(data.encode('utf-8'))
+                    http_session = get_http_session()
+                    resp = http_session.request(
+                        method_u, url, data=data,
+                        headers={'Content-Type': 'text/plain', **(headers or {})},
+                        timeout=req_timeout
                     )
                 else:
-                    resp = requests.request(method_u, url, headers=headers or {}, timeout=timeout)
+                    http_session = get_http_session()
+                    resp = http_session.request(method_u, url, headers=headers or {}, timeout=req_timeout)
             else:
                 if isinstance(payload, dict) and method_u == 'GET':
-                    resp = requests.get(url, params=payload, headers=headers or {}, timeout=timeout)
+                    http_session = get_http_session()
+                    resp = http_session.get(url, params=payload, headers=headers or {}, timeout=req_timeout)
                 else:
-                    resp = requests.request(method_u, url, headers=headers or {}, timeout=timeout)
+                    http_session = get_http_session()
+                    resp = http_session.request(method_u, url, headers=headers or {}, timeout=req_timeout)
 
             elapsed = time.time() - started
             try:
                 resp_size = len(resp.content or b'')
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Error getting response size: {e}")
                 resp_size = 0
 
             ok = 200 <= resp.status_code < 300
@@ -863,7 +1090,7 @@ def make_request(
                 'timestamp': datetime.now().isoformat(),
                 'attempt': attempt,
                 'error_message': '' if ok else f'HTTP {resp.status_code}',
-                'response_preview': (resp.text[:1000] if resp.text else '') if not ok else '',
+                'response_preview': (resp.text[:1000] if (not ok and getattr(resp, "text", None)) else ''),
                 'request_size': req_size,
                 'response_size': resp_size,
                 'headers_sent': headers or {},
@@ -883,11 +1110,18 @@ def make_request(
                 retry_after_hdr = (resp.headers or {}).get('Retry-After')
                 if retry_after_hdr:
                     sleep_s = _parse_retry_after_seconds(retry_after_hdr, default=backoff)
+                    sleep_s = min(MAX_BACKOFF_SECONDS, max(0.1, sleep_s))
                 else:
                     sleep_s = backoff
-                time.sleep(min(MAX_BACKOFF, max(0.1, sleep_s)))
-                backoff = min(MAX_BACKOFF, backoff * 2)
-                continue
+                # Light jitter (±50%) to avoid thundering herd; caps preserved
+                j = 0.5 + random.random()  # 0.5..1.5
+                sleep_j = min(MAX_BACKOFF_SECONDS, max(0.1, sleep_s * j))
+                next_backoff = min(MAX_BACKOFF_SECONDS, max(0.1, backoff * 2))
+                return {
+                    '_retry_in': sleep_j,
+                    '_next_backoff': next_backoff,
+                    'attempt': attempt
+                }
             else:
                 # Non-retryable client error
                 return 1
@@ -910,14 +1144,22 @@ def make_request(
             }
             results_tracker.record(result_row)
             pbar.update(1)
-            time.sleep(min(MAX_BACKOFF, backoff))
-            backoff = min(MAX_BACKOFF, backoff * 2)
+            # Do not sleep here; signal the caller to retry later.
+            j = 0.5 + random.random()
+            next_backoff = min(MAX_BACKOFF_SECONDS, max(0.1, backoff * 2))
+            return {
+                '_retry_in': min(MAX_BACKOFF_SECONDS, max(0.1, backoff * j)),
+                '_next_backoff': next_backoff,
+                'attempt': attempt
+            }
         finally:
-            if global_request_sema:
+            if global_request_sema and acquired:
                 try:
                     global_request_sema.release()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Semaphore release error: {e}")
+
+
 
     return error_code
 
@@ -927,16 +1169,49 @@ def make_request(
 # =========================
 def move_file_reasoned(file_path: str, target_dir: str, reason_prefix: str = "") -> bool:
     """Move file to target directory with timestamp and reason prefix"""
+
+    def is_within_prefix(path, prefix):
+        try:
+            return os.path.commonpath([path, prefix]) == prefix
+        except ValueError:
+            return False  # Handles mismatched drives on Windows
+
     try:
-        if not target_dir:
+        file_path = os.path.abspath(os.path.realpath(file_path))
+        target_dir = os.path.abspath(os.path.realpath(target_dir))
+
+        if not target_dir or not os.path.exists(file_path) or not os.path.isfile(file_path):
+            logger.error(f"Invalid file or target: {file_path} -> {target_dir}")
             return False
+
+        allowed_prefixes = [os.path.abspath(p) for p in ['/app/data/', '/tmp/', os.getcwd()]]
+        if not any(is_within_prefix(file_path, p) for p in allowed_prefixes) or \
+           not any(is_within_prefix(target_dir, p) for p in allowed_prefixes):
+            logger.error(f"Path outside allowed: {file_path} -> {target_dir}")
+            return False
+
+        if os.path.dirname(file_path) == target_dir:
+            logger.debug(f"Already in target: {file_path}")
+            return True
+
         os.makedirs(target_dir, exist_ok=True)
         filename = os.path.basename(file_path)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        new_name = f"{ts}_{reason_prefix}{filename}" if reason_prefix else f"{ts}_{filename}"
-        shutil.move(file_path, os.path.join(target_dir, new_name))
-        logger.info(f"📦 Moved file: {filename} -> {new_name} [{reason_prefix.rstrip('_')}]")
+        reason_prefix_clean = "".join(c for c in reason_prefix if c.isalnum() or c in ('-', '_')).rstrip('_')
+        base_name = f"{ts}_{reason_prefix_clean}_{filename}" if reason_prefix_clean else f"{ts}_{filename}"
+        target_path = os.path.join(target_dir, base_name)
+
+        counter = 1
+        while os.path.exists(target_path):
+            base, ext = os.path.splitext(base_name)
+            target_path = os.path.join(target_dir, f"{base}_{counter}{ext}")
+            counter += 1
+
+        shutil.move(file_path, target_path)
+
+        logger.info(f"📦 Moved file: {filename} -> {os.path.basename(target_path)} [{reason_prefix_clean}]")
         return True
+
     except Exception as e:
         logger.error(f"❌ Failed to move {file_path} to {target_dir}: {e}")
         return False
@@ -972,12 +1247,22 @@ class FileWatchdog(FileSystemEventHandler):
     def _calculate_file_hash(self, file_path: str) -> str:
         hash_md5 = hashlib.md5()
         try:
+            if not os.path.exists(file_path):
+                return ""
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                return hash_md5.hexdigest()  # Empty file hash
+            # Use adaptive chunk size with reasonable bounds
+            chunk_size = min(65536, max(4096, file_size // 100))
             with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(4096), b""):
+                for chunk in iter(lambda: f.read(chunk_size), b""):
                     hash_md5.update(chunk)
             return hash_md5.hexdigest()
-        except Exception as e:
+        except (IOError, OSError) as e:
             logger.error(f"Error calculating hash for {file_path}: {e}")
+            return ""
+        except Exception as e:
+            logger.error(f"Unexpected error calculating hash for {file_path}: {e}")
             return ""
 
     def _is_valid_csv_file(self, file_path: str) -> bool:
@@ -985,7 +1270,12 @@ class FileWatchdog(FileSystemEventHandler):
             if not file_path.lower().endswith('.csv'):
                 return False
             initial_size = os.path.getsize(file_path)
-            time.sleep(1.0)
+            if initial_size == 0:
+                logger.warning(f"File {file_path} is empty")
+                return False
+            # Adaptive delay based on file size, with reasonable bounds
+            delay = min(3.0, max(0.5, initial_size / (1024 * 1024)))  # 0.5s to 3s based on MB
+            time.sleep(delay)
             final_size = os.path.getsize(file_path)
             if initial_size != final_size:
                 logger.info(f"File {file_path} is still being written, skipping for now")
@@ -1014,10 +1304,15 @@ class FileWatchdog(FileSystemEventHandler):
                 has_data = False
                 name_map = {orig: norm for orig, norm in zip(raw_headers, headers)}
                 for row in reader:
-                    nrow = {name_map.get(k, (k or '')).lower(): (v or '').strip() for k, v in row.items()}
-                    if nrow.get('webhook_url'):
-                        has_data = True
-                        break
+                    nrow = {name_map.get(k, k or ''): (v or '').strip() for k, v in row.items()}
+                    u = nrow.get('webhook_url', '').strip()
+                    if u:
+                        # Normalize URL if needed
+                        if not u.startswith(('http://', 'https://')):
+                            u = 'https://' + u
+                        if _is_valid_url(u):
+                            has_data = True
+                            break
                 if not has_data:
                     logger.warning(f"File {file_path} has no non-empty webhook_url values")
                     try:
@@ -1054,20 +1349,34 @@ class FileWatchdog(FileSystemEventHandler):
         try:
             with self.file_lock:
                 file_path = os.path.abspath(file_path)
+                
+                # Check inflight status first to prevent race conditions
+                with self.inflight_lock:
+                    if file_path in self.inflight_files:
+                        logger.debug(f"Already pending (in-memory): {file_path} — event {event_type} ignored")
+                        return
+                
                 if not self._is_valid_csv_file(file_path):
+                    return
+                if not os.path.exists(file_path):
+                    logger.warning(f"File disappeared during processing: {file_path}")
                     return
                 file_hash = self._calculate_file_hash(file_path)
                 if not file_hash:
+                    logger.warning(f"Could not calculate hash for {file_path}, skipping")
                     return
                 if self.db_manager.is_file_processed(file_path, file_hash):
                     logger.info(f"⏭️  Duplicate content detected for {os.path.basename(file_path)} (hash match).")
                     dup_dir = self.config.get('csv', {}).get('duplicates_path', '')
-                    moved = move_file_reasoned(file_path, dup_dir, reason_prefix="dup_")
-                    if moved:
-                        try:
-                            self.db_manager.update_file_status(file_path, 'skipped_duplicate')
-                        except Exception:
-                            pass
+                    if dup_dir:
+                        moved = move_file_reasoned(file_path, dup_dir, reason_prefix="dup_")
+                        if moved:
+                            try:
+                                self.db_manager.update_file_status(file_path, 'skipped_duplicate')
+                            except Exception:
+                                pass
+                    else:
+                        logger.warning("No duplicates_path configured, cannot move duplicate file")
                     return
                 enc = _detect_encoding(file_path)
                 with open(file_path, 'r', encoding=enc, newline='') as f:
@@ -1084,6 +1393,8 @@ class FileWatchdog(FileSystemEventHandler):
                 if status in ('queued', 'processing'):
                     logger.debug(f"Already {status} (DB): {file_path} — event {event_type} ignored")
                     return
+                # Immediately mark as queued to prevent race conditions
+                self.db_manager.update_file_status(file_path, 'queued')
                 with self.inflight_lock:
                     if file_path in self.inflight_files:
                         logger.debug(f"Already pending (in-memory): {file_path} — event {event_type} ignored")
@@ -1107,7 +1418,20 @@ class FileWatchdog(FileSystemEventHandler):
                 }
                 with self.inflight_lock:
                     self.inflight_files.add(file_path)
-                self.job_queue.put(job_info)
+                try:
+                    max_queue_size = self.config.get('watchdog', {}).get('max_queue_size', 100)
+                    if self.job_queue.qsize() >= max_queue_size:
+                        logger.warning(f"Queue full ({max_queue_size}), skipping file: {os.path.basename(file_path)}")
+                        with self.inflight_lock:
+                            self.inflight_files.discard(file_path)
+                        self.db_manager.update_file_status(file_path, 'queue_full')
+                        return
+                    self.job_queue.put_nowait(job_info)
+                except queue.Full:
+                    logger.error(f"Queue full, cannot process: {os.path.basename(file_path)}")
+                    with self.inflight_lock:
+                        self.inflight_files.discard(file_path)
+                    self.db_manager.update_file_status(file_path, 'queue_full')
                 logger.info(f"🆕 New CSV file detected: {os.path.basename(file_path)} "
                             f"({row_count} rows, {file_size} bytes) via {event_type}")
         except Exception as e:
@@ -1160,6 +1484,24 @@ class BulkAPITrigger:
         self.processing_threads: List[Thread] = []
         self.shutdown_event = Event()
 
+    def _calculate_file_hash(self, file_path: str) -> str:
+        hash_md5 = hashlib.md5()
+        try:
+            if not os.path.exists(file_path):
+                return ""
+            # Use larger chunk size for better performance on large files
+            chunk_size = min(65536, max(4096, os.path.getsize(file_path) // 100))
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(chunk_size), b""):
+                    hash_md5.update(chunk)
+            return hash_md5.hexdigest()
+        except (IOError, OSError) as e:
+            logger.error(f"Error calculating hash for {file_path}: {e}")
+            return ""
+        except Exception as e:
+            logger.error(f"Unexpected error calculating hash for {file_path}: {e}")
+            return ""
+        
     def trigger_webhooks(self, 
                         csv_files: List[str] = None, 
                         job_name: str = None,
@@ -1193,24 +1535,31 @@ class BulkAPITrigger:
             )
             results_tracker = EnhancedResultsTracker(job_id, self.db_manager)
             error_window: List[int] = []
+            MAX_ERROR_WINDOW = min(100, rate_config.get('window_size', 20) * 2)  # Cap based on config
             successful_count = 0
             failed_count = 0
             processed_count = 0
             logger.info(f"⚡ Processing {total_requests} requests with {rate_config.get('max_workers', 3)} workers")
             with ThreadPoolExecutor(max_workers=rate_config.get('max_workers', 3)) as executor:
-                with tqdm(
-                        total=total_requests,
-                        desc="🌐 API Requests",
-                        dynamic_ncols=False,
-                        ascii=True,
-                        file=sys.stdout,
-                        mininterval=1.0,
-                        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
-                        disable=not (sys.stdout.isatty() or os.getenv("FORCE_TQDM","0") == "1")
-                    ) as pbar:
+                pbar = None
+                try:
+                    pbar = tqdm(
+                            total=total_requests,
+                            desc="🌐 API Requests",
+                            dynamic_ncols=False,
+                            ascii=True,
+                            file=sys.stdout,
+                            mininterval=1.0,
+                            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+                            disable=not (sys.stdout.isatty() or os.getenv("FORCE_TQDM","0") == "1")
+                        )
+                    
+                    futures: Dict = {}
+                    new_futures_q: queue.Queue = queue.Queue()
+                    timers: List[Timer] = []
 
-                    futures = {
-                        executor.submit(
+                    def _submit_now(webhook: Dict, attempt: int = 0, next_backoff: Optional[float] = None):
+                        fut = executor.submit(
                             make_request,
                             webhook['url'],
                             webhook['method'],
@@ -1222,81 +1571,157 @@ class BulkAPITrigger:
                             results_tracker,
                             self.config.get('retry', {}).get('timeout', 30),
                             self.global_request_sema,
-                            self.config.get('retry', {}).get('retry_delay', 1.0)
-                        ): webhook
-                        for webhook in all_webhooks
-                    }
+                            self.config.get('retry', {}).get('retry_delay', 1.0),
+                            attempt,
+                            next_backoff
+                        )
+                        futures[fut] = webhook
 
-                    for future in as_completed(futures):
-                        try:
-                            error = future.result()
-                            error_window.append(error)
-                            if len(error_window) > rate_config.get('window_size', 20):
-                                error_window.pop(0)
-
-                            processed_count += 1
-
-                            # Update success/failure counters
-                            if error == 0:
-                                successful_count += 1
-                            else:
-                                failed_count += 1
-
-                            # -------- Logger progress every PROGRESS_EVERY_N --------
-                            PROGRESS_EVERY_N = int(os.getenv("PROGRESS_EVERY_N", "50"))
-                            if processed_count % PROGRESS_EVERY_N == 0:
-                                success_rate = (successful_count / processed_count) * 100
-                                throughput = rate_limiter.get_throughput()
-                                logger.info(
-                                    f"📈 Progress: {processed_count}/{total_requests} "
-                                    f"({success_rate:.1f}% success, {throughput:.2f} req/s)"
+                    def _schedule_retry(delay_s: float, webhook: Dict, attempt: int, next_backoff: float):
+                        # Use a Timer so we don't block any worker threads during the delay
+                        def _resubmit():
+                            try:
+                                fut = executor.submit(
+                                    make_request,
+                                    webhook['url'],
+                                    webhook['method'],
+                                    webhook['payload'],
+                                    webhook['header'],
+                                    self.config.get('retry', {}).get('max_retries', 3),
+                                    rate_limiter,
+                                    pbar,
+                                    results_tracker,
+                                    self.config.get('retry', {}).get('timeout', 30),
+                                    self.global_request_sema,
+                                    self.config.get('retry', {}).get('retry_delay', 1.0),
+                                    attempt,
+                                    next_backoff
                                 )
+                                new_futures_q.put((fut, webhook))
+                            except Exception as _e:
+                                logger.debug(f"Retry resubmission failed: {_e}")
+                        t = Timer(max(0.01, float(delay_s)), _resubmit)
+                        t.daemon = True
+                        t.start()
+                        timers.append(t)
 
-                            # -------- Slack progress: independent of success/failure --------
-                            if (
-                                self.notification_manager.slack_config.get('enabled')
-                                and os.getenv("SLACK_NOTIFY_PROGRESS", "false").lower() == "true"
-                            ):
-                                every_n = int(os.getenv("SLACK_PROGRESS_EVERY_N", "25"))
-                                # fire on cadence, and also on the very first processed item (optional)
-                                if processed_count % every_n == 0 or processed_count == 1:
-                                    urgency = os.getenv("SLACK_PROGRESS_URGENCY", "auto")
-                                    if urgency == "auto":
-                                        urgency = _slack_urgency_for_progress(successful_count, processed_count)
+                    # Seed initial submissions
+                    for webhook in all_webhooks:
+                        _submit_now(webhook, attempt=0, next_backoff=None)
 
-                                    msg = (
-                                        f"⏳ *{job_name}* in progress\n"
-                                        f"{processed_count}/{total_requests} processed\n"
-                                        f"✅ {successful_count} success | ❌ {failed_count} failed\n"
-                                        f"~{(processed_count/total_requests*100):.1f}% done"
+                    # Process dynamically until all work (including scheduled retries) completes
+                    while futures or any(t.is_alive() for t in timers):
+                        # Merge any newly scheduled futures
+                        try:
+                            while True:
+                                fut, wh = new_futures_q.get_nowait()
+                                futures[fut] = wh
+                        except queue.Empty:
+                            pass
+
+                        if not futures:
+                            time.sleep(0.05)
+                            continue
+
+                        # Wait for at least one completion among current futures
+                        for future in as_completed(list(futures.keys()), timeout=0.5):
+                            webhook = futures.pop(future)
+                            try:
+                                result = future.result()
+                                # Retry signal returns a dict with _retry_in
+                                if isinstance(result, dict) and result.get('_retry_in') is not None:
+                                    delay = float(result.get('_retry_in', 0.0))
+                                    attempt_val = int(result.get('attempt', 0))
+                                    next_backoff = float(result.get('_next_backoff', self.config.get('retry', {}).get('retry_delay', 1.0)))
+
+                                    if attempt_val < self.config.get('retry', {}).get('max_retries', 3):
+                                        # Schedule re-submission later (non-blocking)
+                                        _schedule_retry(delay, webhook, attempt_val, next_backoff)
+                                    else:
+                                        # Out of retries: count as failure
+                                        error_window.append(1)
+                                        window_size = min(rate_config.get('window_size', 20), MAX_ERROR_WINDOW)
+                                        if len(error_window) > window_size:
+                                            error_window = error_window[-window_size:]
+                                        processed_count += 1
+                                        failed_count += 1
+                                    break  # Rebuild the as_completed set to notice newly added futures
+
+                                # Normal int result path
+                                error = int(result)
+                                error_window.append(error)
+                                window_size = min(rate_config.get('window_size', 20), MAX_ERROR_WINDOW)
+                                if len(error_window) > window_size:
+                                    error_window = error_window[-window_size:]
+                                processed_count += 1
+                                if error == 0:
+                                    successful_count += 1
+                                else:
+                                    failed_count += 1
+
+                                # -------- Logger progress every PROGRESS_EVERY_N --------
+                                PROGRESS_EVERY_N = int(os.getenv("PROGRESS_EVERY_N", "50"))
+                                if processed_count % PROGRESS_EVERY_N == 0:
+                                    success_rate = (successful_count / max(1, processed_count)) * 100
+                                    throughput = rate_limiter.get_throughput()
+                                    logger.info(
+                                        f"📈 Progress: {processed_count}/{total_requests} "
+                                        f"({success_rate:.1f}% success, {throughput:.2f} req/s)"
                                     )
-                                    try:
-                                        self.notification_manager.send_slack_notification(msg, urgency)
-                                    except Exception as _e:
-                                        # keep running even if Slack chokes
-                                        logger.debug(f"Progress Slack suppressed: {type(_e).__name__}: {_e}")
 
+                                # -------- Slack progress: independent of success/failure --------
+                                if (
+                                    self.notification_manager.slack_config.get('enabled')
+                                    and os.getenv("SLACK_NOTIFY_PROGRESS", "false").lower() == "true"
+                                ):
+                                    every_n = int(os.getenv("SLACK_PROGRESS_EVERY_N", "25"))
+                                    if processed_count % every_n == 0 or processed_count == 1:
+                                        urgency = os.getenv("SLACK_PROGRESS_URGENCY", "auto")
+                                        if urgency == "auto":
+                                            urgency = _slack_urgency_for_progress(successful_count, processed_count)
+
+                                        msg = (
+                                            f"⏳ *{job_name}* in progress\n"
+                                            f"{processed_count}/{total_requests} processed\n"
+                                            f"✅ {successful_count} success | ❌ {failed_count} failed\n"
+                                            f"~{(processed_count/total_requests*100):.1f}% done"
+                                        )
+                                        try:
+                                            self.notification_manager.send_slack_notification(msg, urgency)
+                                        except Exception as _e:
+                                            logger.debug(f"Progress Slack suppressed: {type(_e).__name__}: {_e}")
+                            except Exception as e:
+                                logger.error(f"💥 Failed processing {webhook['url']}: {e}")
+                                failed_count += 1
+                                processed_count += 1
+
+                            # -------- Dynamic rate adjustment (your fixed direction) --------
+                            if processed_count % rate_config.get('window_size', 20) == 0 and error_window:
+                                error_rate = sum(error_window) / len(error_window)
+                                current_rate = rate_limiter.get_rate()
+                                if error_rate > rate_config.get('error_threshold', 0.3):
+                                    new_rate = max(self.config.get('rate_limiting', {}).get('base_rate_limit', 3.0),
+                                                   current_rate / 1.2)
+                                    rate_limiter.adjust_rate(new_rate)
+                                elif error_rate < rate_config.get('error_threshold', 0.3) / 2:
+                                    new_rate = min(self.config.get('rate_limiting', {}).get('max_rate_limit', 5.0),
+                                                   current_rate * 1.2)
+                                    rate_limiter.adjust_rate(new_rate)
+
+                            break # Break inner for-loop to refresh the as_completed set
+
+                finally:
+                    if pbar:
+                        try:
+                            pbar.close()
                         except Exception as e:
-                            webhook = futures[future]
-                            logger.error(f"💥 Failed processing {webhook['url']}: {e}")
-                            failed_count += 1
-                            processed_count += 1
-
-                        # -------- Dynamic rate adjustment (your fixed direction) --------
-                        if processed_count % rate_config.get('window_size', 20) == 0 and error_window:
-                            error_rate = sum(error_window) / len(error_window)
-                            current_rate = rate_limiter.get_rate()
-                            if error_rate > rate_config.get('error_threshold', 0.3):
-                                # too many errors -> slow down
-                                new_rate = max(self.config.get('rate_limiting', {}).get('base_rate_limit', 3.0),
-                                            current_rate / 1.2)
-                                rate_limiter.adjust_rate(new_rate)
-                            elif error_rate < rate_config.get('error_threshold', 0.3) / 2:
-                                # healthy -> speed up (but cap)
-                                new_rate = min(self.config.get('rate_limiting', {}).get('max_rate_limit', 5.0),
-                                            current_rate * 1.2)
-                                rate_limiter.adjust_rate(new_rate)
-
+                            logger.debug(f"Error closing progress bar: {e}")
+                    # Ensure all handlers are properly closed
+                    try:
+                        for handler in logging.getLogger().handlers:
+                            handler.flush()
+                    except Exception:
+                        pass
 
             # Finalize job
             self.db_manager.finish_job(job_id, successful_count, failed_count)
@@ -1359,6 +1784,7 @@ class BulkAPITrigger:
                     out_dir=report_dir,  # <— key change
                 )
                 logger.info(f"📝 Job report written: {report_path}")
+                prune_old_reports(os.path.dirname(report_path), keep=int(os.getenv("REPORT_KEEP", "200")))
 
                 if (
                     self.notification_manager.slack_config.get('enabled')
@@ -1424,10 +1850,14 @@ class BulkAPITrigger:
                         self.db_manager.update_file_status(job_info['csv_file'], 'failed')
                         continue
                     current_hash = self._calculate_file_hash(job_info['csv_file'])
-                    if current_hash and current_hash != job_info['file_hash']:
+                    if current_hash and job_info.get('file_hash') and current_hash != job_info['file_hash']:
                         logger.info(f"File changed during debounce, re-queuing: {job_info['csv_file']}")
                         job_info['file_hash'] = current_hash
-                        self.job_queue.put(job_info)
+                        try:
+                            self.job_queue.put_nowait(job_info)
+                        except queue.Full:
+                            logger.warning(f"Queue full, cannot re-queue changed file: {job_info['csv_file']}")
+                            self.db_manager.update_file_status(job_info['csv_file'], 'queue_full')
                         continue
                     if self.db_manager.is_file_processed(job_info['csv_file'], job_info['file_hash']):
                         logger.info(f"File already processed: {os.path.basename(job_info['csv_file'])}")
@@ -1453,44 +1883,59 @@ class BulkAPITrigger:
                         logger.error(f"❌ Auto-processing failed for {job_info['csv_file']}: {e}")
                         self.db_manager.update_file_status(job_info['csv_file'], 'failed')
                 finally:
-                    with self.inflight_lock:
-                        self.inflight_files.discard(job_info['csv_file'])
-                    self.job_queue.task_done()
+                    try:
+                        with self.inflight_lock:
+                            self.inflight_files.discard(job_info['csv_file'])
+                    except Exception as e:
+                        logger.error(f"Error cleaning up inflight files: {e}")
+                    try:
+                        self.job_queue.task_done()
+                    except Exception as e:
+                        logger.error(f"Error marking queue task as done: {e}")
             except queue.Empty:
                 continue
             except Exception as e:
                 logger.error(f"Error in queue processing worker: {e}")
                 logger.error(traceback.format_exc())
 
-    def _calculate_file_hash(self, file_path: str) -> str:
-        hash_md5 = hashlib.md5()
-        try:
-            with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(4096), b""):
-                    hash_md5.update(chunk)
-            return hash_md5.hexdigest()
-        except Exception as e:
-            logger.error(f"Error calculating hash for {file_path}: {e}")
-            return ""
-
     def stop_watchdog(self):
         """Stop the watchdog system gracefully"""
         logger.info("🛑 Stopping watchdog system...")
         self.shutdown_event.set()
-        if getattr(self, 'processing_threads', None):
-            for t in self.processing_threads:
-                t.join(timeout=10)
+        
+        # Stop observer first
         if self.observer:
-            self.observer.stop()
-            self.observer.join()
+            try:
+                self.observer.stop()
+                self.observer.join(timeout=5)
+            except Exception as e:
+                logger.error(f"Error stopping observer: {e}")
+        
+        # Wait for processing threads
+        if getattr(self, 'processing_threads', None):
+            for i, t in enumerate(self.processing_threads):
+                try:
+                    t.join(timeout=10)
+                    if t.is_alive():
+                        logger.warning(f"Processing thread {i} did not shutdown gracefully")
+                except Exception as e:
+                    logger.error(f"Error joining thread {i}: {e}")
+        
         logger.info("🛑 Watchdog system stopped")
 
     def get_system_status(self) -> Dict:
         """Get comprehensive system status"""
         try:
-            queue_size = self.job_queue.qsize() if hasattr(self.job_queue, 'qsize') else 0
-        except Exception:
-            queue_size = 0
+            if hasattr(self.job_queue, 'qsize'):
+                queue_size = self.job_queue.qsize()
+            else:
+                queue_size = 0
+        except (AttributeError, OSError) as e:
+            logger.debug(f"Cannot get queue size: {e}")
+            queue_size = -1  # Indicate unknown
+        except Exception as e:
+            logger.error(f"Unexpected error getting queue size: {e}")
+            queue_size = -1
         processing_threads_running = bool(self.processing_threads) and any(t.is_alive() for t in self.processing_threads)
         return {
             'watchdog_enabled': self.watchdog_enabled,
@@ -1546,6 +1991,84 @@ def create_health_check_server():
                     self.end_headers()
                     self.wfile.write(json.dumps(response_data, indent=2).encode())
 
+                elif self.path.startswith('/jobs'):
+                    parts = [p for p in self.path.split('/') if p]
+                    if len(parts) == 1:  # /jobs
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        try:
+                            with self.trigger.db_manager.get_connection() as conn:
+                                cur = conn.cursor()
+                                cur.execute("""
+                                    SELECT job_id, job_name, total_requests, successful_requests, failed_requests,
+                                           start_time, end_time, duration_seconds, status
+                                    FROM job_history
+                                    ORDER BY start_time DESC
+                                    LIMIT 50
+                                """)
+                                rows = cur.fetchall()
+                                jobs = [{
+                                    "job_id": r[0], "job_name": r[1], "total": r[2],
+                                    "successful": r[3], "failed": r[4],
+                                    "start_time": r[5], "end_time": r[6],
+                                    "duration_seconds": r[7], "status": r[8],
+                                } for r in rows]
+                        except Exception as e:
+                            jobs = {"error": str(e)}
+                        self.wfile.write(json.dumps(jobs, indent=2, default=str).encode())
+
+                    elif len(parts) >= 2:
+                        job_id = parts[1]
+                        if len(parts) == 2:  # /jobs/<job_id>
+                            self.send_response(200)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            data = self.trigger.db_manager.get_job_stats(job_id)
+                            self.wfile.write(json.dumps(data, indent=2, default=str).encode())
+
+                        elif len(parts) == 3 and parts[2] == 'errors':  # /jobs/<job_id>/errors
+                            self.send_response(200)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            try:
+                                with self.trigger.db_manager.get_connection() as conn:
+                                    cur = conn.cursor()
+                                    cur.execute("""
+                                        SELECT url, method, status, status_code, error_message, timestamp
+                                        FROM webhook_results
+                                        WHERE job_id = ?
+                                          AND (status = 'error' OR status = 'exception')
+                                        ORDER BY timestamp DESC
+                                        LIMIT 50
+                                    """, (job_id,))
+                                    errs = [{
+                                        "url": r[0], "method": r[1], "status": r[2],
+                                        "status_code": r[3], "error_message": r[4], "timestamp": r[5]
+                                    } for r in cur.fetchall()]
+                            except Exception as e:
+                                errs = {"error": str(e)}
+                            self.wfile.write(json.dumps(errs, indent=2, default=str).encode())
+
+                        elif len(parts) == 3 and parts[2] == 'report':  # /jobs/<job_id>/report
+                            self.send_response(200)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            rpt_dir = self.trigger.config.get('deployment', {}).get('report_path', '/app/data/reports')
+                            path = os.path.join(rpt_dir, f"job_{job_id}.json")
+                            try:
+                                with open(path, "r", encoding="utf-8") as f:
+                                    content = json.load(f)
+                            except Exception as e:
+                                content = {"error": str(e), "path": path}
+                            self.wfile.write(json.dumps(content, indent=2, default=str).encode())
+
+                        else:
+                            self.send_response(404)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(b'{"error": "Invalid job endpoint"}')
+
                 elif self.path == '/metrics':
                     self.send_response(200)
                     self.send_header('Content-type', 'application/json')
@@ -1571,6 +2094,28 @@ def create_health_check_server():
                         metrics = {'error': str(e)}
                     self.wfile.write(json.dumps(metrics, indent=2).encode())
 
+                elif self.path == '/config':
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    try:
+                        cfg = dict(self.trigger.config)  # shallow copy
+                        # redact secrets
+                        try:
+                            if 'notifications' in cfg and 'email' in cfg['notifications']:
+                                cfg['notifications']['email'] = dict(cfg['notifications']['email'])
+                                if 'password' in cfg['notifications']['email']:
+                                    cfg['notifications']['email']['password'] = '***REDACTED***'
+                            if 'notifications' in cfg and 'slack' in cfg['notifications']:
+                                cfg['notifications']['slack'] = dict(cfg['notifications']['slack'])
+                                if 'webhook_url' in cfg['notifications']['slack']:
+                                    cfg['notifications']['slack']['webhook_url'] = '***REDACTED***'
+                        except Exception:
+                            pass
+                        self.wfile.write(json.dumps(cfg, indent=2, default=str).encode())
+                    except Exception as e:
+                        self.wfile.write(json.dumps({'error': str(e)}).encode())
+
                 else:
                     self.send_response(404)
                     self.end_headers()
@@ -1589,14 +2134,14 @@ def create_health_check_server():
         return None
 
 
-def keep_alive_with_watchdog(trigger: BulkAPITrigger):
+def keep_alive_with_watchdog(trigger: BulkAPITrigger, port: int = 8000):
     """Enhanced keep-alive with watchdog functionality"""
     logger.info("🔄 Webhook processing completed. Starting keep-alive with watchdog...")
     health_server_starter = create_health_check_server()
     if health_server_starter and trigger.config.get('deployment', {}).get('health_check_enabled', True):
-        health_thread = Thread(target=health_server_starter, args=(trigger, 8000), daemon=True)
+        health_thread = Thread(target=health_server_starter, args=(trigger, port), daemon=True)
         health_thread.start()
-        logger.info("🏥 Health check server started on port 8000")
+        logger.info(f"🏥 Health check server started on port {port}")
     trigger.start_watchdog()
     logger.info("📊 Database contains job history and results for analysis")
     logger.info("👀 Watchdog is monitoring for new CSV files")
@@ -1606,11 +2151,16 @@ def keep_alive_with_watchdog(trigger: BulkAPITrigger):
         while True:
             time.sleep(300)  # 5 minute intervals
             heartbeat_count += 1
-            status = trigger.get_system_status()
-            logger.info(f"💓 Heartbeat #{heartbeat_count} - System Status: "
-                        f"Queue: {status['queue_size']}, "
-                        f"Watchdog: {'✅' if status['watchdog_running'] else '❌'}, "
-                        f"DB: {'✅' if status['database_accessible'] else '❌'}")
+            try:
+                status = trigger.get_system_status()
+                logger.info(f"💓 Heartbeat #{heartbeat_count} - System Status: "
+                            f"Queue: {status['queue_size']}, "
+                            f"Watchdog: {'✅' if status['watchdog_running'] else '❌'}, "
+                            f"DB: {'✅' if status['database_accessible'] else '❌'}")
+            except Exception as e:
+                logger.error(f"💓 Heartbeat #{heartbeat_count} - Status check failed: {e}")
+                status = {'queue_size': 0, 'watchdog_running': False, 'database_accessible': False}
+
             backup_hours = trigger.config.get('database', {}).get('backup_interval_hours', 24)
             ticks_per_backup = max(1, int((backup_hours * 60) / 5))
             if trigger.config.get('database', {}).get('backup_enabled', True) and (heartbeat_count % ticks_per_backup == 0):
@@ -1619,7 +2169,8 @@ def keep_alive_with_watchdog(trigger: BulkAPITrigger):
                     backup_database(trigger.db_manager)
                 except Exception as e:
                     logger.error(f"Database backup failed: {e}")
-            if status['queue_size'] > 0:
+
+            if status.get('queue_size', 0) > 0:
                 logger.info(f"📋 Processing queue has {status['queue_size']} pending files")
     except KeyboardInterrupt:
         logger.info("🛑 Received interrupt signal. Shutting down gracefully...")
@@ -1845,9 +2396,9 @@ def load_environment_config():
             'max_workers': int(os.getenv('MAX_WORKERS', '3'))
         },
         'retry': {
-            'max_retries': int(os.getenv('MAX_RETRIES', '3')),
-            'timeout': int(os.getenv('REQUEST_TIMEOUT', '30')),
-            'retry_delay': float(os.getenv('RETRY_DELAY', '1.0')),
+            'max_retries': max(0, min(int(os.getenv('MAX_RETRIES', '3')), 10)),
+            'timeout': max(1, min(int(os.getenv('REQUEST_TIMEOUT', '30')), 300)),
+            'retry_delay': max(0.1, min(float(os.getenv('RETRY_DELAY', '1.0')), 60.0)),
         },
         'deployment': {
             'keep_alive': os.getenv('KEEP_ALIVE', 'true').lower() == 'true',
@@ -1873,7 +2424,8 @@ def load_environment_config():
                 'enabled': os.getenv('SLACK_NOTIFICATIONS', 'false').lower() == 'true',
                 'webhook_url': os.getenv('SLACK_WEBHOOK_URL', ''),
                 'notify_on_completion': os.getenv('SLACK_NOTIFY_COMPLETION', 'true').lower() == 'true',
-                'notify_on_file_detected': os.getenv('SLACK_NOTIFY_FILE_DETECTED', 'true').lower() == 'true'
+                'notify_on_file_detected': os.getenv('SLACK_NOTIFY_FILE_DETECTED', 'true').lower() == 'true',
+                'notify_on_progress': os.getenv('SLACK_NOTIFY_PROGRESS', 'false').lower() == 'true'
             }
         },
         'database': {
@@ -1894,6 +2446,53 @@ def load_environment_config():
         }
     }
 
+def validate_config(config: Dict) -> Dict:
+    """Validate and sanitize configuration"""
+    validated = dict(config)
+    
+    # Ensure numeric values are within reasonable bounds
+    rate_limit = validated.get('rate_limiting', {})
+    rate_limit['max_workers'] = max(1, min(int(rate_limit.get('max_workers', 3)), 50))
+    rate_limit['base_rate_limit'] = max(0.1, min(float(rate_limit.get('base_rate_limit', 3.0)), 100.0))
+    rate_limit['max_rate_limit'] = max(rate_limit.get('base_rate_limit', 3.0), 
+                                      min(float(rate_limit.get('max_rate_limit', 5.0)), 100.0))
+    rate_limit['window_size'] = max(10, min(int(rate_limit.get('window_size', 20)), 1000))
+    rate_limit['error_threshold'] = max(0.01, min(float(rate_limit.get('error_threshold', 0.3)), 1.0))
+    
+    # Ensure retry values are reasonable
+    # Ensure retry values are reasonable
+    retry = validated.get('retry', {})
+    retry['max_retries'] = max(0, min(int(retry.get('max_retries', 3) or 3), 10))
+    retry['timeout'] = max(1, min(int(retry.get('timeout', 30) or 30), 300))
+    retry['retry_delay'] = max(0.1, min(float(retry.get('retry_delay', 1.0) or 1.0), 60.0))
+    
+    # Ensure paths exist for CSV operations
+    csv_config = validated.get('csv', {})
+    for path_key in ['archive_path', 'duplicates_path', 'rejected_path']:
+        path = csv_config.get(path_key)
+        if path:
+            try:
+                os.makedirs(path, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"Cannot create {path_key} directory {path}: {e}")
+    
+    try:
+        slack_cfg = validated.get('notifications', {}).get('slack', {}) or {}
+        if slack_cfg.get('enabled') and not str(slack_cfg.get('webhook_url', '')).startswith('https://hooks.slack.com/'):
+            logger.warning("Slack enabled but webhook URL does not look like a Slack webhook URL.")
+    except Exception:
+        pass
+    try:
+        email_cfg = validated.get('notifications', {}).get('email', {}) or {}
+        if email_cfg.get('enabled'):
+            missing = [k for k in ['smtp_server', 'smtp_port', 'username', 'password', 'from_email']
+                       if not email_cfg.get(k)]
+            if missing:
+                logger.warning(f"Email enabled but missing required fields: {missing}")
+    except Exception:
+        pass
+
+    return validated
 
 # =========================
 # Main
@@ -1930,7 +2529,7 @@ def main():
         skip_rows = input("Rows to skip (default: 0): ").strip()
         keep_running = input("Keep container alive with watchdog? (Y/n): ").strip().lower()
         enable_watchdog = input("Enable file monitoring? (Y/n): ").strip().lower()
-        config = load_environment_config()
+        config = validate_config(load_environment_config())
         if job_name:
             config.setdefault('deployment', {})['job_name'] = job_name
         if skip_rows.isdigit():
@@ -1938,6 +2537,8 @@ def main():
         config.setdefault('deployment', {})['keep_alive'] = keep_running not in ['n', 'no', 'false']
         config.setdefault('watchdog', {})['enabled'] = enable_watchdog not in ['n', 'no', 'false']
         trigger = BulkAPITrigger(config)
+        NotificationManager.send_startup_test_notifications(trigger)
+        
         trigger_instance = trigger
         if csv_file.lower() not in ['auto', 'watchdog']:
             files = [csv_file]
@@ -1948,12 +2549,13 @@ def main():
             )
             logger.info(f"🏆 Job completed with ID: {job_id}")
         if config['deployment']['keep_alive']:
-            keep_alive_with_watchdog(trigger)
+            keep_alive_with_watchdog(trigger, port=int(os.getenv('HEALTH_PORT', '8000')))
         return
 
     if os.getenv('DEPLOYMENT_MODE') or os.getenv('RAILWAY_ENVIRONMENT') or os.getenv('DOCKER_CONTAINER'):
         logger.info("🐳 Enhanced deployment mode detected")
-        config = load_environment_config()
+        config = validate_config(load_environment_config())
+
         # Optional: merge file config
         for config_file in ['config.yaml', 'config.yml', 'config.json']:
             if os.path.exists(config_file):
@@ -1969,15 +2571,77 @@ def main():
 
                 # Start from file as defaults, then apply ENV on top so ENV wins
                 merged = dict(file_config or {})
-                _deep_merge(merged, config)   # config is your ENV-based dict from load_environment_config()
+                _deep_merge(merged, config)   # ENV-based dict from load_environment_config()
                 config = merged
 
                 logger.info(f"📋 Loaded additional config from {config_file} (ENV overrides file)")
                 break
-        logger.info(f"⚙️  Configuration loaded successfully")
-        logger.debug(f"Config details: {json.dumps(config, indent=2, default=str)}")
+
+        logger.info("⚙️  Configuration loaded successfully")
+
+        # ---- a(3): redact secrets before dumping config ----
+        def _redact_cfg(cfg: dict) -> dict:
+            try:
+                cleaned = json.loads(json.dumps(cfg))  # deep copy
+            except Exception:
+                cleaned = dict(cfg)
+            try:
+                notif = cleaned.get('notifications', {})
+                if 'email' in notif:
+                    notif['email'] = dict(notif['email'])
+                    if 'password' in notif['email']:
+                        notif['email']['password'] = '***REDACTED***'
+                if 'slack' in notif:
+                    notif['slack'] = dict(notif['slack'])
+                    if 'webhook_url' in notif['slack']:
+                        notif['slack']['webhook_url'] = '***REDACTED***'
+            except Exception:
+                pass
+            return cleaned
+
+        logger.debug(f"Config details: {json.dumps(_redact_cfg(config), indent=2, default=str)}")
+
+        # Ensure keys exist
+        config.setdefault("deployment", {})
+        config.setdefault("notifications", {})
+        config["notifications"].setdefault("slack", {})
+        config["notifications"].setdefault("email", {})
+
+        # Ensure report path exists
+        report_path = config["deployment"].get("report_path", "/app/data/logs")
+        os.makedirs(report_path, exist_ok=True)
+        config["deployment"]["report_path"] = report_path
+
+        # Normalize booleans (sometimes YAML “yes” or ENV “1” cause surprises)
+        for k in ["notify_on_completion", "notify_on_file_detected"]:
+            if k in config["notifications"].get("slack", {}):
+                v = str(config["notifications"]["slack"].get(k)).lower()
+                config["notifications"]["slack"][k] = v in ["1", "true", "yes"]
+            if k in config["notifications"].get("email", {}):
+                v = str(config["notifications"]["email"].get(k)).lower()
+                config["notifications"]["email"][k] = v in ["1", "true", "yes"]
+
+        logger.debug("✅ Finalized config after defaults & normalization")
+
+        # ---- a(2): log effective notification switches at startup ----
+        slack_cfg = config.get('notifications', {}).get('slack', {})
+        email_cfg = config.get('notifications', {}).get('email', {})
+        logger.info(
+            "🔔 Notifications — Slack: %s (progress=%s, on_completion=%s, on_new_file=%s) | "
+            "Email: %s (on_completion=%s, on_new_file=%s)",
+            slack_cfg.get('enabled'),
+            os.getenv('SLACK_NOTIFY_PROGRESS', 'false'),
+            slack_cfg.get('notify_on_completion'),
+            slack_cfg.get('notify_on_file_detected'),
+            email_cfg.get('enabled'),
+            email_cfg.get('notify_on_completion'),
+            email_cfg.get('notify_on_file_detected'),
+        )
+
         trigger = BulkAPITrigger(config)
+        NotificationManager.send_startup_test_notifications(trigger)
         trigger_instance = trigger
+
         csv_file = os.getenv('CSV_FILE', 'AUTO')
         if csv_file != 'AUTO':
             logger.info(f"📄 Processing specific file: {csv_file}")
@@ -1989,11 +2653,13 @@ def main():
             logger.info(f"🏆 Initial job completed with ID: {job_id}")
         else:
             scan_existing_files(trigger)
+
         if config['deployment']['keep_alive']:
-            keep_alive_with_watchdog(trigger)
+            keep_alive_with_watchdog(trigger, port=int(os.getenv('HEALTH_PORT', '8000')))
         else:
             logger.info("🏁 Job completed. Container will exit.")
         return
+
 
     # CLI mode
     parser = argparse.ArgumentParser(description="🚀 Enhanced Bulk API Trigger Platform")
@@ -2015,7 +2681,7 @@ def main():
         logger.error("❌ CSV file path required. Use --help for usage information.")
         return
 
-    config = load_environment_config()
+    config = validate_config(load_environment_config())
     if args.config:
         file_config = ConfigManager.load_config_file(args.config)
         for key, value in file_config.items():
@@ -2057,6 +2723,7 @@ def main():
         return
 
     trigger = BulkAPITrigger(config)
+    NotificationManager.send_startup_test_notifications(trigger)
     trigger_instance = trigger
 
     if args.csv_file.lower() == 'watchdog':
@@ -2073,7 +2740,7 @@ def main():
     )
     logger.info(f"🏆 Job completed with ID: {job_id}")
     if args.keep_alive:
-        keep_alive_with_watchdog(trigger)
+        keep_alive_with_watchdog(trigger, port=args.health_port)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,8 @@ services:
     build: .
     container_name: bulk-api-trigger
     restart: unless-stopped
+    ports:
+      - "8000:8000"  # Expose health check port
     volumes:
       - ./data:/app/data
       - ./config.yaml:/app/config.yaml:ro
@@ -15,6 +17,16 @@ services:
       - JOB_NAME=Docker Bulk API Job
       - WATCHDOG_ENABLED=true
       - WATCH_PATHS=/app/data/csv
+      - REPORT_PATH=/app/data/reports
+      
+      # CSV Processing
+      - CSV_FILE=AUTO
+      - DEBOUNCE_DELAY=3.0
+      - SKIP_ROWS=0
+      - ARCHIVE_PROCESSED=true
+      - ARCHIVE_PATH=/app/data/csv/processed
+      - DUPLICATES_PATH=/app/data/csv/duplicates
+      - REJECTED_PATH=/app/data/csv/rejected
       
       # Rate Limiting
       - MAX_WORKERS=5
@@ -23,15 +35,28 @@ services:
       - MAX_RATE_LIMIT=10.0
       - ERROR_THRESHOLD=0.3
       - WINDOW_SIZE=20
+      - PROCESSING_WORKERS=5
+      - GLOBAL_MAX_REQUESTS=20
       
       # Request Settings
       - MAX_RETRIES=3
       - REQUEST_TIMEOUT=30
-      - SKIP_ROWS=0
+      - RETRY_DELAY=1.0
       
       # Database
       - DATABASE_ENABLED=true
       - DATABASE_PATH=/app/data/webhook_results.db
+      - DATABASE_BACKUP=true
+      - DATABASE_BACKUP_INTERVAL_HOURS=24
+      
+      # Health & Metrics
+      - HEALTH_CHECK_ENABLED=true
+      - HEALTH_PORT=8000
+      - METRICS_ENABLED=true
+      
+      # Logging
+      - LOG_LEVEL=INFO
+      - MAX_LOG_SIZE_MB=100
       
       # Notifications (uncomment and configure as needed)
       # - EMAIL_NOTIFICATIONS=true
@@ -44,10 +69,11 @@ services:
       
       # - SLACK_NOTIFICATIONS=true
       # - SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
-    
-    # Health check
+      # - SLACK_NOTIFY_PROGRESS=true
+      
+    # Enhanced health check
     healthcheck:
-      test: ["CMD", "python", "-c", "import sqlite3; conn=sqlite3.connect('/app/data/webhook_results.db'); conn.close()"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health", "||", "exit", "1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -64,3 +90,5 @@ services:
   #     - bulk-api-trigger
 
 volumes:
+  bulk_api_data:
+    driver: local

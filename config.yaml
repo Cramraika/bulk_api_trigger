@@ -1,6 +1,15 @@
 # Bulk API Trigger Configuration
 # ================================
 
+# Watchdog settings for file monitoring
+watchdog:
+  enabled: true
+  watch_paths:
+    - /app/data/csv
+  auto_process: true
+  debounce_delay: 3.0
+  max_queue_size: 100
+
 # Rate limiting and performance settings
 rate_limiting:
   base_rate_limit: 2.0        # Minimum delay between requests (seconds)
@@ -13,8 +22,17 @@ rate_limiting:
 # Retry and timeout settings
 retry:
   max_retries: 3              # Number of retries per failed request
-  retry_delay: 1.0            # Delay between retries (seconds)
+  retry_delay: 1.0            # Base delay between retries (seconds) - now properly used
   timeout: 30                 # Request timeout (seconds)
+
+# Deployment settings
+deployment:
+  keep_alive: true            # Keep container running after completion
+  skip_rows: 0                # Number of rows to skip in CSV
+  job_name: null              # Custom job name (null = auto-generate)
+  metrics_enabled: true       # Enable system metrics collection
+  health_check_enabled: true  # Enable health check endpoint
+  report_path: /app/data/reports  # Path for job reports
 
 # Notification settings
 notifications:
@@ -29,33 +47,28 @@ notifications:
       - admin@example.com
       - team@example.com
     notify_on_completion: true
-
+    notify_on_file_detected: false
   slack:
     enabled: false
     webhook_url: https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
     notify_on_completion: true
+    notify_on_file_detected: true
 
 # Database settings
 database:
   enabled: true
-  path: /data/webhook_results.db
+  path: /app/data/webhook_results.db
+  backup_enabled: true
+  backup_interval_hours: 24
 
 # CSV processing settings
 csv:
-  required_columns:
-    - webhook_url
-  optional_columns:
-    - method
-    - payload
-    - header
-    - name
-    - group
   chunk_size: 1000
+  archive_processed: true
+  archive_path: /app/data/csv/processed
+  duplicates_path: /app/data/csv/duplicates
+  rejected_path: /app/data/csv/rejected
+  archive_on_validation_failure: true
   file_patterns:
-    - "/data/csv/*.csv"
-
-# Deployment settings
-deployment:
-  keep_alive: true            # Keep container running after completion
-  log_level: INFO             # Logging level
-  max_log_size_mb: 100        # Maximum log file size
+    - "/app/data/csv/*.csv"
+    - "/app/data/*.csv"

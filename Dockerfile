@@ -20,14 +20,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY webhook_trigger.py .
 COPY config.yaml ./config.yaml
 
-# Create directories for data, logs, csv, processed files and backups
+# Create directories for data, logs, csv, processed files, backups, and reports
 RUN mkdir -p /app/data \
     /app/data/logs \
     /app/data/csv \
     /app/data/csv/processed \
     /app/data/csv/duplicates \
     /app/data/csv/rejected \
-    /app/data/backups
+    /app/data/backups \
+    /app/data/reports
 
 # Set proper permissions
 RUN chmod +x webhook_trigger.py && \
@@ -41,14 +42,17 @@ ENV PYTHONUNBUFFERED=1 \
     WATCH_PATHS=/app/data/csv \
     AUTO_PROCESS=true \
     HEALTH_CHECK_ENABLED=true \
-    METRICS_ENABLED=true
+    HEALTH_PORT=8000 \
+    METRICS_ENABLED=true \
+    REPORT_PATH=/app/data/reports \
+    DATABASE_PATH=/app/data/webhook_results.db
 
 # Expose ports for health checks and metrics
 EXPOSE 8000
 
-# Enhanced health check that tests watchdog and database
+# Enhanced health check that tests both HTTP endpoint and database
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-    CMD curl -f http://localhost:8000/health || python -c "import sqlite3; conn=sqlite3.connect('/app/data/webhook_results.db'); conn.close()" || exit 1
+    CMD curl -f http://localhost:8000/health || exit 1
 
 # Run the application
 CMD ["python", "webhook_trigger.py"]
