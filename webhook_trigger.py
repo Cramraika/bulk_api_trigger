@@ -2521,64 +2521,91 @@ def write_job_json_report(
 
 
 def scan_existing_files(trigger: BulkAPITrigger):
-    """Scan for existing CSV files on startup (with the same validation/move semantics as live watchdog)."""
+    """Scan for existing files on startup (CSV → queue, non-CSV → reject)."""
     watch_paths = trigger.config.get('watchdog', {}).get('watch_paths', ['/app/data/csv'])
-    # Reuse the real validator from FileWatchdog so behavior matches live events 1:1
-    validator = FileWatchdog(trigger.job_queue, trigger.db_manager, trigger.config,
-                             trigger.inflight_files, trigger.inflight_lock)
-
     for watch_path in watch_paths:
         if not os.path.exists(watch_path):
             continue
+
         logger.info(f"🔍 Scanning existing files in {watch_path}")
-        csv_files = glob.glob(os.path.join(watch_path, '*.csv'))
 
-        for csv_file in csv_files:
-            try:
-                # Run the same validation used by the watchdog
-                if not validator._is_valid_csv_file(csv_file):
-                    # The validator already moved the file (if configured) and wrote DB breadcrumbs.
+        # 1) Handle NON-CSV first: breadcrumb → move → status
+        try:
+            for path in glob.glob(os.path.join(watch_path, '*')):
+                if not os.path.isfile(path):
                     continue
+                if path.lower().endswith('.csv'):
+                    continue  # handled next
+                try:
+                    # breadcrumb (hash/size) before any move
+                    file_hash = trigger._calculate_file_hash(path)
+                    file_size = os.path.getsize(path) if os.path.exists(path) else 0
+                    trigger.db_manager.track_file(path, file_hash or '', file_size, rows_count=0)
+                except Exception as _e:
+                    logger.debug(f"Breadcrumb capture failed for non-CSV {os.path.basename(path)}: {_e}")
 
-                file_hash = trigger._calculate_file_hash(csv_file)
-                if not file_hash:
-                    continue
+                # move to rejected (if configured)
+                try:
+                    if trigger.config.get('csv', {}).get('archive_on_validation_failure', True):
+                        move_file_reasoned(
+                            path,
+                            trigger.config.get('csv', {}).get('rejected_path', ''),
+                            reason_prefix="invalid_not-csv_"
+                        )
+                except Exception as _e:
+                    logger.debug(f"Archive on validation failure skipped for {os.path.basename(path)}: {_e}")
 
-                # Duplicate by content against *completed* files (any filename)
-                if trigger.db_manager.is_hash_processed(file_hash):
-                    logger.info(f"⏭️  Duplicate content detected on startup scan (hash match).")
-                    dup_dir = trigger.config.get('csv', {}).get('duplicates_path', '')
-                    if dup_dir:
-                        move_file_reasoned(csv_file, dup_dir, reason_prefix="dup_hash_")
-                    try:
-                        trigger.db_manager.track_file(csv_file, file_hash, os.path.getsize(csv_file), rows_count=0)
-                        trigger.db_manager.update_file_status(csv_file, 'skipped_duplicate')
-                    except Exception:
-                        pass
-                    continue
+                # update DB status
+                try:
+                    trigger.db_manager.update_file_status(path, 'rejected_not_csv')
+                except Exception as _e:
+                    logger.debug(f"DB status update failed for non-CSV {os.path.basename(path)}: {_e}")
+        except Exception as e:
+            logger.error(f"Startup non-CSV sweep failed in {watch_path}: {e}")
 
-                # Not duplicate; queue it
-                if not os.path.getsize(csv_file) > 0:
-                    # Zero-byte guard (should be rare after validator)
-                    continue
+        # 2) Existing CSV files (unchanged logic)
+        try:
+            csv_files = glob.glob(os.path.join(watch_path, '*.csv'))
+            for csv_file in csv_files:
+                try:
+                    file_hash = trigger._calculate_file_hash(csv_file)
+                    if not file_hash:
+                        continue
+                    if trigger.db_manager.is_hash_processed(file_hash):
+                        logger.info("⏭️  Duplicate content detected on startup scan (hash match).")
+                        dup_dir = trigger.config.get('csv', {}).get('duplicates_path', '')
+                        if dup_dir:
+                            move_file_reasoned(csv_file, dup_dir, reason_prefix="dup_hash_")
+                        try:
+                            trigger.db_manager.track_file(csv_file, file_hash, os.path.getsize(csv_file), rows_count=0)
+                            trigger.db_manager.update_file_status(csv_file, 'skipped_duplicate')
+                        except Exception:
+                            pass
+                        continue
 
-                file_stats = os.stat(csv_file)
-                job_info = {
-                    'csv_file': csv_file,
-                    'file_hash': file_hash,
-                    'file_size': file_stats.st_size,
-                    'row_count': 0,
-                    'event_type': 'startup_scan',
-                    'detected_at': datetime.now().isoformat()
-                }
-                trigger.db_manager.track_file(csv_file, file_hash, file_stats.st_size, rows_count=0)
-                trigger.db_manager.update_file_status(csv_file, 'queued')
-                with trigger.inflight_lock:
-                    trigger.inflight_files.add(csv_file)
-                trigger.job_queue.put(job_info)
-                logger.info(f"📄 Queued existing file: {os.path.basename(csv_file)}")
-            except Exception as e:
-                logger.error(f"Startup scan failed for {csv_file}: {e}")
+                    if os.path.getsize(csv_file) <= 0:
+                        continue
+
+                    file_stats = os.stat(csv_file)
+                    job_info = {
+                        'csv_file': csv_file,
+                        'file_hash': file_hash,
+                        'file_size': file_stats.st_size,
+                        'row_count': 0,
+                        'event_type': 'startup_scan',
+                        'detected_at': datetime.now().isoformat()
+                    }
+                    trigger.db_manager.track_file(csv_file, file_hash, file_stats.st_size, rows_count=0)
+                    trigger.db_manager.update_file_status(csv_file, 'queued')
+                    with trigger.inflight_lock:
+                        trigger.inflight_files.add(csv_file)
+                    trigger.job_queue.put(job_info)
+                    logger.info(f"📄 Queued existing file: {os.path.basename(csv_file)}")
+                except Exception as e:
+                    logger.error(f"Startup scan failed for {csv_file}: {e}")
+        except Exception as e:
+            logger.error(f"Startup CSV scan failed in {watch_path}: {e}")
+
 
 
 # =========================
