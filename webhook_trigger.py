@@ -258,6 +258,8 @@ def _create_http_session() -> requests.Session:
     adapter = HTTPAdapter(pool_connections=pool, pool_maxsize=pool, max_retries=0)
     s.mount('http://', adapter)
     s.mount('https://', adapter)
+    # Set a sane default User-Agent; allow override via env
+    s.headers.update({'User-Agent': os.getenv('HTTP_USER_AGENT', 'BulkAPITrigger/1.0')})
     return s
 
 import threading
@@ -305,6 +307,16 @@ class DatabaseManager:
                         conn.close()
                     except Exception as e:
                         logger.error(f"Error closing database connection: {e}")
+
+    def is_file_processed(self, file_path: str, file_hash: str) -> bool:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT 1 FROM file_tracking
+                WHERE file_path = ? AND file_hash = ? AND status = 'completed'
+                LIMIT 1
+            ''', (file_path, file_hash))
+            return cursor.fetchone() is not None
 
     def init_database(self):
         with self.get_connection() as conn:
@@ -384,6 +396,8 @@ class DatabaseManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_webhook_timestamp ON webhook_results(timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_job_status ON job_history(status)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_status ON file_tracking(status)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_path_hash_status ON file_tracking(file_path, file_hash, status)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_hash_status ON file_tracking(file_hash, status)')
             conn.commit()
 
     def save_webhook_result(self, job_id: str, result: Dict):
@@ -481,14 +495,14 @@ class DatabaseManager:
             ''', (file_path, file_hash, file_size, rows_count))
             conn.commit()
 
-    def is_file_processed(self, file_path: str, file_hash: str) -> bool:
+    def is_hash_processed(self, file_hash: str) -> bool:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT 1 FROM file_tracking 
-                WHERE file_path = ? AND file_hash = ? AND status = 'completed'
+                WHERE file_hash = ? AND status = 'completed'
                 LIMIT 1
-            ''', (file_path, file_hash))
+            ''', (file_hash,))
             row = cursor.fetchone()
             return bool(row)
 
@@ -977,8 +991,8 @@ def read_multiple_csv_files(file_patterns: List[str] = None, chunk_size: int = 1
     for pattern in file_patterns:
         found_files.extend(glob.glob(pattern))
 
-    # De-dup and sort newest first
-    found_files = sorted(set(found_files), key=lambda x: os.path.getmtime(x), reverse=True)
+    # De-dup, drop vanished files, and sort newest first
+    found_files = sorted({f for f in found_files if os.path.exists(f)}, key=os.path.getmtime, reverse=True)
 
 
     if not found_files:
@@ -1034,7 +1048,8 @@ def _parse_retry_after_seconds(header_value: str, default: float) -> float:
         if dt:
             now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.utcnow()
             delay = (dt - now).total_seconds()
-            return max(default, delay)
+            # Clamp to sane minimum/maximum before returning
+            return min(MAX_BACKOFF_SECONDS, max(default, max(0.1, delay)))
     except Exception:
         pass
 
@@ -1078,8 +1093,20 @@ def make_request(
         attempt += 1
         acquired = False
         if global_request_sema:
-            global_request_sema.acquire()
-            acquired = True
+            try:
+                # Avoid indefinite blocking if the semaphore can't be acquired
+                acquire_timeout = max(1, int(os.getenv('SEMAPHORE_ACQUIRE_TIMEOUT', '30')))
+            except Exception:
+                acquire_timeout = 30
+            try:
+                if not global_request_sema.acquire(timeout=acquire_timeout):
+                    # Back off briefly and re-attempt this loop iteration
+                    time.sleep(min(MAX_BACKOFF_SECONDS, base_backoff))
+                    continue
+                acquired = True
+            except Exception:
+                # If semaphore is misconfigured, proceed without it rather than deadlock
+                acquired = False
 
         try:
             rate_limiter.sleep_if_needed()
@@ -1317,10 +1344,53 @@ class FileWatchdog(FileSystemEventHandler):
     def _is_valid_csv_file(self, file_path: str) -> bool:
         try:
             if not file_path.lower().endswith('.csv'):
+                logger.warning(f"Ignoring non-CSV file {file_path}")
+
+                # 1) Compute breadcrumbs first (before move)
+                try:
+                    fh = self._calculate_file_hash(file_path)
+                    fs = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+                    self.db_manager.track_file(file_path, fh or '', fs, rows_count=0)
+                except Exception as _e:
+                    logger.debug(f"Breadcrumb capture (hash/size) failed for non-CSV: {file_path} — {_e}")
+
+                # 2) Move to rejected (if configured)
+                try:
+                    if self.config.get('csv', {}).get('archive_on_validation_failure', True):
+                        move_file_reasoned(
+                            file_path,
+                            self.config.get('csv', {}).get('rejected_path', ''),
+                            reason_prefix="invalid_not-csv_"
+                        )
+                except Exception as _e:
+                    logger.debug(f"Archive on validation failure skipped: {_e}")
+
+                # 3) Update DB status (after move; path remains the 'observed at' key)
+                try:
+                    self.db_manager.update_file_status(file_path, 'rejected_not_csv')
+                except Exception as _e:
+                    logger.debug(f"DB status update for rejected non-CSV failed: {_e}")
+
                 return False
+
             initial_size = os.path.getsize(file_path)
             if initial_size == 0:
                 logger.warning(f"File {file_path} is empty")
+                try:
+                    if self.config.get('csv', {}).get('archive_on_validation_failure', True):
+                        move_file_reasoned(
+                            file_path,
+                            self.config.get('csv', {}).get('rejected_path', ''),
+                            reason_prefix="invalid_empty-file_"
+                        )
+                except Exception:
+                    pass
+                try:
+                    fh = self._calculate_file_hash(file_path)
+                    self.db_manager.track_file(file_path, fh or '', 0, rows_count=0)
+                    self.db_manager.update_file_status(file_path, 'rejected_empty_file')
+                except Exception:
+                    pass
                 return False
             # Adaptive delay based on file size, with reasonable bounds
             delay = min(3.0, max(0.5, initial_size / (1024 * 1024)))  # 0.5s to 3s based on MB
@@ -1349,7 +1419,16 @@ class FileWatchdog(FileSystemEventHandler):
                             )
                     except Exception as _e:
                         logger.debug(f"Archive on validation failure skipped: {_e}")
+                    # record rejection in DB for visibility
+                    try:
+                        fh = self._calculate_file_hash(file_path)
+                        fs = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+                        self.db_manager.track_file(file_path, fh or '', fs, rows_count=0)
+                        self.db_manager.update_file_status(file_path, 'rejected_missing_webhook_url')
+                    except Exception as _e:
+                        logger.debug(f"DB status update for rejected file failed: {_e}")
                     return False
+
                 has_data = False
                 name_map = {orig: norm for orig, norm in zip(raw_headers, headers)}
                 for row in reader:
@@ -1373,7 +1452,16 @@ class FileWatchdog(FileSystemEventHandler):
                             )
                     except Exception as _e:
                         logger.debug(f"Archive on validation failure skipped: {_e}")
+                    # record rejection in DB for visibility
+                    try:
+                        fh = self._calculate_file_hash(file_path)
+                        fs = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+                        self.db_manager.track_file(file_path, fh or '', fs, rows_count=0)
+                        self.db_manager.update_file_status(file_path, 'rejected_empty_webhook_url')
+                    except Exception as _e:
+                        logger.debug(f"DB status update for rejected file failed: {_e}")
                     return False
+
             return True
         except Exception as e:
             logger.error(f"Error validating CSV file {file_path}: {e}")
@@ -1417,16 +1505,35 @@ class FileWatchdog(FileSystemEventHandler):
                 if self.db_manager.is_file_processed(file_path, file_hash):
                     logger.info(f"⏭️  Duplicate content detected for {os.path.basename(file_path)} (hash match).")
                     dup_dir = self.config.get('csv', {}).get('duplicates_path', '')
+                    moved = False
                     if dup_dir:
                         moved = move_file_reasoned(file_path, dup_dir, reason_prefix="dup_")
-                        if moved:
-                            try:
-                                self.db_manager.update_file_status(file_path, 'skipped_duplicate')
-                            except Exception:
-                                pass
                     else:
                         logger.warning("No duplicates_path configured, cannot move duplicate file")
+                    try:
+                        self.db_manager.update_file_status(file_path, 'skipped_duplicate')
+                    except Exception:
+                        pass
                     return
+                
+                if self.db_manager.is_hash_processed(file_hash):
+                    logger.info(f"⏭️  Duplicate content detected (hash match with previously completed file).")
+                    dup_dir = self.config.get('csv', {}).get('duplicates_path', '')
+                    if dup_dir:
+                        move_file_reasoned(file_path, dup_dir, reason_prefix="dup_hash_")
+                    else:
+                        logger.warning("No duplicates_path configured, cannot move duplicate file")
+                    try:
+                        fs = os.path.getsize(file_path)
+                    except Exception:
+                        fs = 0
+                    try:
+                        self.db_manager.track_file(file_path, file_hash, fs, rows_count=0)
+                        self.db_manager.update_file_status(file_path, 'skipped_duplicate')
+                    except Exception:
+                        pass
+                    return
+
                 enc = _detect_encoding(file_path)
                 with open(file_path, 'r', encoding=enc, newline='') as f:
                     delim = _detect_delimiter(f)
@@ -1435,8 +1542,9 @@ class FileWatchdog(FileSystemEventHandler):
                     headers = _normalize_headers(raw_headers)
                 if 'webhook_url' not in headers:
                     logger.warning(f"File {file_path} missing required 'webhook_url' column")
-                    rej_dir = self.config.get('csv', {}).get('rejected_path', '')
-                    move_file_reasoned(file_path, rej_dir, reason_prefix="invalid_")
+                    if self.config.get('csv', {}).get('archive_on_validation_failure', True):
+                        rej_dir = self.config.get('csv', {}).get('rejected_path', '')
+                        move_file_reasoned(file_path, rej_dir, reason_prefix="invalid_missing-webhook_url_")
                     return
                 status = self.db_manager.get_file_status(file_path)
                 if status in ('queued', 'processing'):
@@ -2255,7 +2363,7 @@ def keep_alive_with_watchdog(trigger: BulkAPITrigger, port: int = 8000):
     try:
         heartbeat_count = 0
         while True:
-            time.sleep(300)  # 5 minute intervals
+            time.sleep(HEARTBEAT_INTERVAL)  # honor global heartbeat interval
             heartbeat_count += 1
             try:
                 status = trigger.get_system_status()
@@ -2413,23 +2521,47 @@ def write_job_json_report(
 
 
 def scan_existing_files(trigger: BulkAPITrigger):
-    """Scan for existing CSV files on startup"""
+    """Scan for existing CSV files on startup (with the same validation/move semantics as live watchdog)."""
     watch_paths = trigger.config.get('watchdog', {}).get('watch_paths', ['/app/data/csv'])
+    # Reuse the real validator from FileWatchdog so behavior matches live events 1:1
+    validator = FileWatchdog(trigger.job_queue, trigger.db_manager, trigger.config,
+                             trigger.inflight_files, trigger.inflight_lock)
+
     for watch_path in watch_paths:
         if not os.path.exists(watch_path):
             continue
         logger.info(f"🔍 Scanning existing files in {watch_path}")
         csv_files = glob.glob(os.path.join(watch_path, '*.csv'))
+
         for csv_file in csv_files:
             try:
+                # Run the same validation used by the watchdog
+                if not validator._is_valid_csv_file(csv_file):
+                    # The validator already moved the file (if configured) and wrote DB breadcrumbs.
+                    continue
+
                 file_hash = trigger._calculate_file_hash(csv_file)
                 if not file_hash:
                     continue
-                if trigger.db_manager.is_file_processed(csv_file, file_hash):
-                    logger.debug(f"File already processed: {os.path.basename(csv_file)}")
+
+                # Duplicate by content against *completed* files (any filename)
+                if trigger.db_manager.is_hash_processed(file_hash):
+                    logger.info(f"⏭️  Duplicate content detected on startup scan (hash match).")
+                    dup_dir = trigger.config.get('csv', {}).get('duplicates_path', '')
+                    if dup_dir:
+                        move_file_reasoned(csv_file, dup_dir, reason_prefix="dup_hash_")
+                    try:
+                        trigger.db_manager.track_file(csv_file, file_hash, os.path.getsize(csv_file), rows_count=0)
+                        trigger.db_manager.update_file_status(csv_file, 'skipped_duplicate')
+                    except Exception:
+                        pass
                     continue
+
+                # Not duplicate; queue it
                 if not os.path.getsize(csv_file) > 0:
+                    # Zero-byte guard (should be rare after validator)
                     continue
+
                 file_stats = os.stat(csv_file)
                 job_info = {
                     'csv_file': csv_file,
@@ -2856,9 +2988,13 @@ if __name__ == "__main__":
         except ImportError:
             logger.warning("📦 Installing watchdog dependency...")
             import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "watchdog"])
-            import watchdog  # noqa: F401
-            logger.info("✅ Watchdog dependency installed successfully")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "watchdog"])
+                import watchdog  # noqa: F401
+                logger.info("✅ Watchdog dependency installed successfully")
+            except Exception as e:
+                logger.error(f"⚠️ Watchdog install failed: {e}. Continuing without watchdog.")
+                os.environ["WATCHDOG_ENABLED"] = "false"
         main()
     except KeyboardInterrupt:
         logger.info("🛑 Process interrupted by user")
