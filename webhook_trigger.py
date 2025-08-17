@@ -146,6 +146,43 @@ def _redact_headers(h: Dict[str, str]) -> Dict[str, str]:
             redacted[k] = v
     return redacted
 
+def _resume_marker_path(self, file_path: str, file_hash: str) -> str:
+    base_dir = (
+        self.config.get('deployment', {}).get('report_path')
+        or os.getenv('REPORT_PATH')
+        or '/app/data/reports'
+    )
+    os.makedirs(base_dir, exist_ok=True)
+    base = os.path.basename(file_path).replace('/', '_').replace('\\', '_')
+    return os.path.join(base_dir, f".resume_{file_hash}_{base}.json")
+
+def _load_resume_rows(self, file_path: str, file_hash: str) -> int:
+    try:
+        p = self._resume_marker_path(file_path, file_hash)
+        if not os.path.exists(p):
+            return 0
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return int(data.get("skip_rows") or 0)
+    except Exception:
+        return 0
+
+def _save_resume_rows(self, file_path: str, file_hash: str, skip_rows: int) -> None:
+    try:
+        p = self._resume_marker_path(file_path, file_hash)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"skip_rows": int(max(0, skip_rows))}, f)
+    except Exception as e:
+        logger.debug(f"Resume marker write failed for {file_path}: {e}")
+
+def _clear_resume_marker(self, file_path: str, file_hash: str) -> None:
+    try:
+        p = self._resume_marker_path(file_path, file_hash)
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
 def prune_old_reports(report_dir: str, keep: int = 200):
     try:
         if not os.path.exists(report_dir):
@@ -1722,6 +1759,13 @@ class BulkAPITrigger:
                 all_webhooks, stats = read_multiple_csv_files(skip_rows=skip_rows)
                 files_count = (stats or {}).get('files_processed', 0) if isinstance(stats, dict) else 0
                 csv_file_path = f"Multiple files ({files_count} files)"
+            resume_file_hash = ""
+            try:
+                # Only meaningful if we are processing a single concrete file path
+                if csv_file_path and isinstance(csv_file_path, str) and os.path.isfile(csv_file_path):
+                    resume_file_hash = self._calculate_file_hash(csv_file_path) or ""
+            except Exception as _e:
+                logger.debug(f"Resume hash compute skipped: {_e}")
             if not all_webhooks:
                 # Be explicit to avoid downstream division by zero or progress at 1%
                 message = f"🟡 No valid rows found in {csv_file_path}; skipping job {job_id}."
@@ -1753,6 +1797,16 @@ class BulkAPITrigger:
             failed_count = 0
             processed_count = 0
             logger.info(f"⚡ Processing {total_requests} requests with {rate_config.get('max_workers', 3)} workers")
+            progress_enabled = (
+                self.notification_manager.slack_config.get('enabled')
+                and os.getenv("SLACK_NOTIFY_PROGRESS", "false").lower() == "true"
+            )
+
+            min_pct   = float(os.getenv("SLACK_PROGRESS_MIN_PCT", "5"))        # gate on any notification at all
+            first_pct = float(os.getenv("SLACK_PROGRESS_FIRST_AT_N", "10"))    # first ping at >= this %
+            step_pct  = float(os.getenv("SLACK_PROGRESS_EVERY_N", "5"))        # subsequent pings every this many %
+
+            _last_notified_bucket = -1.0  # local state to prevent duplicates
             with ThreadPoolExecutor(max_workers=rate_config.get('max_workers', 3)) as executor:
                 pbar = None
                 try:
@@ -1874,6 +1928,12 @@ class BulkAPITrigger:
                                 if pbar:
                                     pbar.update(1)
                                 rate_limiter.tick()
+                                if resume_file_hash and (processed_count % 500 == 0):
+                                    try:
+                                        # 'skip_rows' is the caller-provided initial skip; add what we've finished now
+                                        self._save_resume_rows(csv_file_path, resume_file_hash, skip_rows + processed_count)
+                                    except Exception as _e:
+                                        logger.debug(f"Resume marker save skipped: {_e}")
 
                                 # periodic progress logging
                                 PROGRESS_EVERY_N = int(os.getenv("PROGRESS_EVERY_N", "50"))
@@ -1884,37 +1944,43 @@ class BulkAPITrigger:
                                         f"📈 Progress: {processed_count}/{total_requests} "
                                         f"({success_rate:.1f}% success, {throughput:.2f} req/s)"
                                     )
+                                # --- persist resume marker every ~500 completed rows ---
+                                if resume_file_hash and (processed_count % 500 == 0):
+                                    try:
+                                        # skip_rows param indicates how many rows were intentionally skipped at start
+                                        self._save_resume_rows(csv_file_path, resume_file_hash, skip_rows + processed_count)
+                                    except Exception as _e:
+                                        logger.debug(f"Resume marker save skipped: {_e}")
+                                # --- percent-only throttled progress notification ---
+                                if progress_enabled and total_requests > 0:
+                                    pct_done = (processed_count / total_requests) * 100.0
 
-                                # optional slack progress
-                                if (
-                                    self.notification_manager.slack_config.get('enabled')
-                                    and os.getenv("SLACK_NOTIFY_PROGRESS", "false").lower() == "true"
-                                ):
-                                    every_n = int(os.getenv("SLACK_PROGRESS_EVERY_N", "25"))
-                                    first_at_n = int(os.getenv("SLACK_PROGRESS_FIRST_AT_N", "10"))
-                                    min_pct = float(os.getenv("SLACK_PROGRESS_MIN_PCT", "5"))
-                                    pct_done = (processed_count / max(1, total_requests)) * 100.0
+                                    if pct_done >= min_pct:
+                                        # decide the "bucket" to notify at (first at >= first_pct, then every step_pct)
+                                        if pct_done < first_pct:
+                                            bucket = -1.0
+                                        else:
+                                            step_index = max(0, int((pct_done - first_pct) // max(1e-9, step_pct)))
+                                            bucket = first_pct + step_index * step_pct
 
-                                    should_send = (
-                                        processed_count >= first_at_n
-                                        and pct_done >= min_pct
-                                        and (processed_count % every_n == 0 or processed_count == total_requests)
-                                    )
+                                        # send once per bucket
+                                        if bucket >= 0 and bucket > _last_notified_bucket:
+                                            urgency = os.getenv("SLACK_PROGRESS_URGENCY", "auto")
+                                            if urgency == "auto":
+                                                urgency = _slack_urgency_for_progress(successful_count, processed_count)
 
-                                    if should_send:
-                                        urgency = os.getenv("SLACK_PROGRESS_URGENCY", "auto")
-                                        if urgency == "auto":
-                                            urgency = _slack_urgency_for_progress(successful_count, processed_count)
-                                        msg = (
-                                            f"⏳ *{job_name}* in progress\n"
-                                            f"{processed_count}/{total_requests} processed\n"
-                                            f"✅ {successful_count} success | ❌ {failed_count} failed\n"
-                                            f"~{pct_done:.1f}% done"
-                                        )
-                                        try:
-                                            self.notification_manager.send_slack_notification(msg, urgency)
-                                        except Exception as _e:
-                                            logger.debug(f"Progress Slack suppressed: {type(_e).__name__}: {_e}")
+                                            msg = (
+                                                f"⏳ *{job_name}* in progress\n"
+                                                f"{processed_count}/{total_requests} processed\n"
+                                                f"✅ {successful_count} success | ❌ {failed_count} failed\n"
+                                                f"~{pct_done:.1f}% done"
+                                            )
+                                            try:
+                                                self.notification_manager.send_slack_notification(msg, urgency)
+                                                _last_notified_bucket = bucket
+                                            except Exception as _e:
+                                                logger.debug(f"Progress Slack suppressed: {type(_e).__name__}: {_e}")
+
 
                             except Exception as e:
                                 logger.error(f"💥 Failed processing {webhook['url']}: {e}")
@@ -2028,7 +2094,11 @@ class BulkAPITrigger:
             except Exception as _e:
                 logger.error(f"Failed to write job JSON report: {_e}")
 
-
+            try:
+                if resume_file_hash:
+                    self._clear_resume_marker(csv_file_path, resume_file_hash)
+            except Exception:
+                pass
 
             return job_id
 
@@ -2100,11 +2170,24 @@ class BulkAPITrigger:
                     logger.info(f"🎬 Auto-processing file: {os.path.basename(job_info['csv_file'])}")
                     self.db_manager.update_file_status(job_info['csv_file'], 'processing')
                     try:
+                        resume_skip = 0
+                        try:
+                            # prefer the hash we already have; else use the one we computed above; else compute now
+                            fh_for_resume = job_info.get('file_hash') or current_hash or self._calculate_file_hash(job_info['csv_file']) or ""
+                            if fh_for_resume:
+                                resume_skip = int(self._load_resume_rows(job_info['csv_file'], fh_for_resume) or 0)
+                                if resume_skip > 0:
+                                    logger.info(f"⏯️  Resuming {os.path.basename(job_info['csv_file'])} from row {resume_skip}")
+                        except Exception as _e:
+                            logger.debug(f"Resume check failed: {_e}")
+
                         job_id = self.trigger_webhooks(
                             csv_files=[job_info['csv_file']],
                             job_name=job_name,
+                            skip_rows=resume_skip,
                             triggered_by='watchdog'
                         )
+
                         self.db_manager.update_file_status(job_info['csv_file'], 'completed', job_id)
                         logger.info(f"✅ Auto-processing completed for: {os.path.basename(job_info['csv_file'])}")
                     except Exception as e:
