@@ -7,8 +7,10 @@ watchdog:
   watch_paths:
     - /app/data/csv
   auto_process: true
+  processing_workers: 1           # Add: file worker threads (env can override)
   debounce_delay: 3.0
   max_queue_size: 100
+
 
 # Rate limiting and performance settings
 rate_limiting:
@@ -33,6 +35,7 @@ deployment:
   metrics_enabled: true       # Enable system metrics collection
   health_check_enabled: true  # Enable health check endpoint
   report_path: /app/data/reports  # Path for job reports
+  report_keep: 200                # Add: max JSON reports to retain
 
 # Notification settings
 notifications:
@@ -53,6 +56,12 @@ notifications:
     webhook_url: https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
     notify_on_completion: true
     notify_on_file_detected: true
+    notify_on_progress: false         # Add: enable progress messages
+    progress_every_n: 25              # Add: send progress every N items
+    progress_urgency: auto            # Add: auto/low/normal/high/critical
+    progress_first_at_n: 10           # Add: first progress only after N processed
+    progress_min_pct: 5               # Add: minimum % threshold before sending
+
 
 # Database settings
 database:
@@ -64,6 +73,8 @@ database:
 # CSV processing settings
 csv:
   chunk_size: 1000
+  required_columns: ["webhook_url"]                      # Add
+  optional_columns: ["method","payload","header","name","group"]  # Add
   archive_processed: true
   archive_path: /app/data/csv/processed
   duplicates_path: /app/data/csv/duplicates

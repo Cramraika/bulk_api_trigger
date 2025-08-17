@@ -252,84 +252,6 @@ from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException
 
 NON_RETRIABLE_STATUS = {400, 401, 403, 404, 405, 410, 413, 415, 422}
-
-def _parse_retry_after(resp: requests.Response) -> Optional[float]:
-    ra = resp.headers.get("Retry-After")
-    if not ra:
-        return None
-    try:
-        return float(ra)  # seconds
-    except ValueError:
-        try:
-            dt = email.utils.parsedate_to_datetime(ra)  # HTTP-date
-            return max(0.0, (dt - datetime.now(dt.tzinfo or timezone.utc)).total_seconds())
-        except Exception:
-            return None
-
-def do_request(row: Dict, attempt: int, timeout: float = 30.0) -> Dict:
-    url   = row['webhook_url']
-    meth  = (row.get('method') or 'GET').upper()
-    hdrs  = row.get('headers_sent') or {}
-    body  = row.get('payload')
-    session = get_http_session()
-
-    t0 = time.time()
-    code = None
-    resp_preview = ""
-    req_sz = len(json.dumps(body).encode("utf-8")) if isinstance(body, (dict, list)) else (len(body.encode("utf-8")) if isinstance(body, str) else 0)
-    try:
-        if meth in ("GET", "DELETE"):
-            resp = session.request(meth, url, headers=hdrs, timeout=timeout)
-        else:
-            if isinstance(body, (dict, list)):
-                resp = session.request(meth, url, headers=hdrs, json=body, timeout=timeout)
-            elif isinstance(body, str) and body:
-                resp = session.request(meth, url, headers=hdrs, data=body.encode("utf-8"), timeout=timeout)
-            else:
-                resp = session.request(meth, url, headers=hdrs, timeout=timeout)
-
-        code = resp.status_code
-        ok = 200 <= code < 300
-        resp_preview = (resp.text or "")[:1000]
-
-        retry_after = _parse_retry_after(resp) if code == 429 else None
-
-        return {
-            "url": url,
-            "method": meth,
-            "status": "success" if ok else "failed",
-            "status_code": code,
-            "response_time": time.time() - t0,
-            "timestamp": datetime.now().isoformat(),
-            "attempt": attempt,
-            "error_message": None,
-            "response_preview": resp_preview,
-            "request_size": req_sz,
-            "response_size": len(resp.content or b""),
-            "headers_sent": _redact_headers(hdrs),
-            "retry_after_seconds": retry_after,
-            "retriable": (code == 429) or (500 <= code < 600),
-            "permanent": (code in NON_RETRIABLE_STATUS),
-        }
-    except RequestException as e:
-        return {
-            "url": url,
-            "method": meth,
-            "status": "failed",
-            "status_code": None,
-            "response_time": time.time() - t0,
-            "timestamp": datetime.now().isoformat(),
-            "attempt": attempt,
-            "error_message": f"{type(e).__name__}: {e}",
-            "response_preview": resp_preview,
-            "request_size": req_sz,
-            "response_size": 0,
-            "headers_sent": _redact_headers(hdrs),
-            "retry_after_seconds": None,
-            "retriable": True,    # network errors are retriable by default
-            "permanent": False,
-        }
-
 def _create_http_session() -> requests.Session:
     s = requests.Session()
     pool = max(1, int(os.getenv('HTTP_POOL_MAXSIZE', '16') or '16'))
@@ -897,8 +819,14 @@ class EnhancedResultsTracker:
 # =========================
 # CSV reading & request execution
 # =========================
-def read_csv_with_validation(csv_path: str, chunk_size: int = 1000, skip_rows: int = 0) -> Tuple[List[Dict], Dict]:
-    """Read a single CSV, validate 'webhook_url', build webhooks list + stats."""
+def read_csv_with_validation(csv_path: str, chunk_size: int = 1000, skip_rows: int = 0):
+    """Read a single CSV, validate rows, and return (webhooks, stats)"""
+    # Allow env to override only if caller passed the default
+    if chunk_size == 1000:
+        try:
+            chunk_size = int(os.getenv("CSV_CHUNK_SIZE", "1000"))
+        except ValueError:
+            chunk_size = 1000
     webhooks: List[Dict] = []
     stats = {
         'file': csv_path,
@@ -953,39 +881,45 @@ def read_csv_with_validation(csv_path: str, chunk_size: int = 1000, skip_rows: i
 
                 method = (nrow.get('method') or 'GET').upper()
 
-                headers_sent = {}
-                if nrow.get('header'):
-                    header_text = nrow['header']
-                    if len(header_text) > MAX_HEADER_SIZE:  # Limit header size
-                        logger.warning(f"Header too large for URL {url}, truncating")
-                        header_text = header_text[:MAX_HEADER_SIZE]
-                    try:
-                        headers_sent = json.loads(header_text)
-                        if isinstance(headers_sent, dict):
-                            validated_headers = {}
-                            for k, v in list(headers_sent.items())[:MAX_HEADER_COUNT]:
-                                if isinstance(k, str) and isinstance(v, (str, int, float)):
-                                    k_clean = ''.join(c for c in str(k).strip() if c.isprintable() and c not in '\r\n')
-                                    v_clean = ''.join(c for c in str(v).strip() if c.isprintable() and c not in '\r\n')
-                                    if k_clean and len(k_clean) <= 100 and len(v_clean) <= 1000:
-                                        validated_headers[k_clean] = v_clean
-                            headers_sent = validated_headers
-                        else:
-                            headers_sent = {}
-                    except Exception:
-                        headers_sent = {}
+                # --- Normalize header columns from CSV: accept 'header', 'headers', or 'headers_sent' ---
+                headers_raw = nrow.get('header') or nrow.get('headers') or nrow.get('headers_sent')
+                headers_dict = {}
+                if headers_raw is not None:
+                    if isinstance(headers_raw, dict):
+                        # Validate and sanitize key/value lengths & characters
+                        for k, v in list(headers_raw.items())[:MAX_HEADER_COUNT]:
+                            if isinstance(k, str) and isinstance(v, (str, int, float)):
+                                k_clean = ''.join(c for c in str(k).strip() if c.isprintable() and c not in '\r\n')
+                                v_clean = ''.join(c for c in str(v).strip() if c.isprintable() and c not in '\r\n')
+                                if k_clean and len(k_clean) <= 100 and len(v_clean) <= 1000:
+                                    headers_dict[k_clean] = v_clean
+                    else:
+                        header_text = str(headers_raw).strip()
+                        if len(header_text) > MAX_HEADER_SIZE:
+                            logger.warning(f"Header too large for URL {url}, truncating")
+                            header_text = header_text[:MAX_HEADER_SIZE]
                         try:
-                            parts = header_text.split(';')[:MAX_HEADER_COUNT]
-                            for part in parts:
-                                if ':' in part:
-                                    k, v = part.split(':', 1)
-                                    k_clean = ''.join(c for c in k.strip() if c.isprintable() and c not in '\r\n')
-                                    v_clean = ''.join(c for c in v.strip() if c.isprintable() and c not in '\r\n')
-                                    if k_clean and len(k_clean) <= 100 and len(v_clean) <= 1000:
-                                        headers_sent[k_clean] = v_clean
+                            parsed = json.loads(header_text)
+                            if isinstance(parsed, dict):
+                                for k, v in list(parsed.items())[:MAX_HEADER_COUNT]:
+                                    if isinstance(k, str) and isinstance(v, (str, int, float)):
+                                        k_clean = ''.join(c for c in str(k).strip() if c.isprintable() and c not in '\r\n')
+                                        v_clean = ''.join(c for c in str(v).strip() if c.isprintable() and c not in '\r\n')
+                                        if k_clean and len(k_clean) <= 100 and len(v_clean) <= 1000:
+                                            headers_dict[k_clean] = v_clean
                         except Exception:
-                            pass
-
+                            # Fallback: "Key: Val; Key2: Val2"
+                            try:
+                                parts = header_text.split(';')[:MAX_HEADER_COUNT]
+                                for part in parts:
+                                    if ':' in part:
+                                        k, v = part.split(':', 1)
+                                        k_clean = ''.join(c for c in k.strip() if c.isprintable() and c not in '\r\n')
+                                        v_clean = ''.join(c for c in v.strip() if c.isprintable() and c not in '\r\n')
+                                        if k_clean and len(k_clean) <= 100 and len(v_clean) <= 1000:
+                                            headers_dict[k_clean] = v_clean
+                            except Exception:
+                                pass
 
                 payload = None
                 if nrow.get('payload'):
@@ -1005,7 +939,9 @@ def read_csv_with_validation(csv_path: str, chunk_size: int = 1000, skip_rows: i
                     'url': url,
                     'method': method,
                     'payload': payload,
-                    'header': headers_sent,
+                    'headers': headers_dict,        # normalized
+                    'header': headers_dict,         # backward-compat
+                    'headers_sent': headers_dict,   # backward-compat
                     'name': nrow.get('name') or url,
                     'group': nrow.get('group') or ''
                 })
@@ -1020,22 +956,30 @@ def read_csv_with_validation(csv_path: str, chunk_size: int = 1000, skip_rows: i
 
 def read_multiple_csv_files(file_patterns: List[str] = None, chunk_size: int = 1000, skip_rows: int = 0):
     """Enhanced multi-file CSV reader with pattern matching"""
+    # Allow environment overrides (comma-separated)
     if not file_patterns:
-        env_patterns = os.getenv('CSV_FILE_PATTERNS', '')
-        if env_patterns.strip():
-            file_patterns = [p.strip() for p in env_patterns.split(',') if p.strip()]
-        else:
-            file_patterns = [
-                '/app/data/csv/*.csv',
-                '/app/data/*.csv'
-            ]
+        raw_patterns = os.getenv("CSV_FILE_PATTERNS", "/app/data/csv/*.csv,/app/data/*.csv")
+        file_patterns = [p.strip() for p in raw_patterns.split(",") if p.strip()]
+
+    # Allow env overrides for chunk/skip (preserve explicit args if passed)
+    if chunk_size == 1000:
+        try:
+            chunk_size = int(os.getenv("CSV_CHUNK_SIZE", chunk_size))
+        except ValueError:
+            pass
+    if skip_rows == 0:
+        try:
+            skip_rows = int(os.getenv("SKIP_ROWS", skip_rows))
+        except ValueError:
+            pass
 
     found_files = []
     for pattern in file_patterns:
         found_files.extend(glob.glob(pattern))
 
-    found_files = list(set(found_files))
-    found_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    # De-dup and sort newest first
+    found_files = sorted(set(found_files), key=lambda x: os.path.getmtime(x), reverse=True)
+
 
     if not found_files:
         logger.error(f"No CSV files found matching patterns: {file_patterns}")
@@ -1115,6 +1059,15 @@ def make_request(
     Executes one HTTP request with basic retry/backoff.
     Returns 0 on success, 1 on error (for moving average error window).
     """
+    # Normalize headers param to a clean dict[str, str]
+    if not isinstance(headers, dict):
+        headers = {}
+    else:
+        try:
+            headers = {str(k): (v if isinstance(v, str) else str(v)) for k, v in headers.items()}
+        except Exception:
+            headers = dict(headers)
+
     attempt = int(attempt_start or 0)
     # Base backoff (from env), minimum 0.1s to avoid hot loops if user sets 0
     base_backoff = max(0.1, float(retry_delay or 0.0))
@@ -1240,8 +1193,7 @@ def make_request(
                 'headers_sent': headers or {},
             }
             results_tracker.record(result_row)
-            pbar.update(1)
-            # Do not sleep here; signal the caller to retry later.
+            # Do not update progress here; caller will retry and count final outcome
             j = 0.5 + random.random()
             next_backoff = min(MAX_BACKOFF_SECONDS, max(0.1, backoff * 2))
             return {
@@ -1605,20 +1557,62 @@ class BulkAPITrigger:
                         skip_rows: int = 0,
                         triggered_by: str = 'manual') -> str:
         """Main method to trigger bulk webhooks with enhanced features"""
+        if skip_rows == 0:
+                try:
+                    skip_rows = int(os.getenv("SKIP_ROWS", "0"))
+                except ValueError:
+                    pass
         job_id = generate_job_id()
         if not job_name:
             job_name = f"Bulk API Job {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        logger.info(f"🚀 Starting job: {job_name} (ID: {job_id})")
+        job_logger = logging.LoggerAdapter(logger, {"job_id": job_id, "job_name": job_name})
+        job_logger.info("🚀 Starting job")
         try:
             # Load webhooks
-            if csv_files and csv_files[0] != "AUTO":
-                all_webhooks, stats = read_csv_with_validation(csv_files[0], skip_rows=skip_rows)
-                csv_file_path = csv_files[0]
+            # Load webhooks — explicit arg > .env CSV_FILE > AUTO patterns
+            env_csv = os.getenv("CSV_FILE", "AUTO").strip()
+            env_csv_is_auto = env_csv.upper() == "AUTO"
+
+            # normalize caller input (can be list/tuple/str)
+            target_from_arg = None
+            if csv_files:
+                if isinstance(csv_files, (list, tuple)) and len(csv_files) > 0:
+                    first = str(csv_files[0]).strip()
+                    if first and first.upper() != "AUTO":
+                        target_from_arg = first
+                elif isinstance(csv_files, str):
+                    s = csv_files.strip()
+                    if s and s.upper() != "AUTO":
+                        target_from_arg = s
+
+            try:
+                chunk_size_env = int(os.getenv("CSV_CHUNK_SIZE", "1000"))
+            except ValueError:
+                chunk_size_env = 1000
+
+            if target_from_arg:
+                all_webhooks, stats = read_csv_with_validation(target_from_arg, chunk_size=chunk_size_env, skip_rows=skip_rows)
+                csv_file_path = target_from_arg
+            elif not env_csv_is_auto:
+                all_webhooks, stats = read_csv_with_validation(env_csv, chunk_size=chunk_size_env, skip_rows=skip_rows)
+                csv_file_path = env_csv
             else:
                 all_webhooks, stats = read_multiple_csv_files(skip_rows=skip_rows)
-                csv_file_path = f"Multiple files ({stats.get('files_processed', 0)} files)"
+                files_count = (stats or {}).get('files_processed', 0) if isinstance(stats, dict) else 0
+                csv_file_path = f"Multiple files ({files_count} files)"
             if not all_webhooks:
-                logger.warning("⚠️  No valid webhook URLs found.")
+                # Be explicit to avoid downstream division by zero or progress at 1%
+                message = f"🟡 No valid rows found in {csv_file_path}; skipping job {job_id}."
+                try:
+                    job_logger.warning(message)
+                except NameError:
+                    logger.warning(message)
+                # Soft notifications if available; never fail the job for this
+                try:
+                    if self.notification_manager.slack_config.get('enabled'):
+                        self.notification_manager.send_slack_notification(message, 'low')
+                except Exception:
+                    pass
                 return job_id
             total_requests = len(all_webhooks)
             logger.info(f"📊 Loaded {total_requests} webhook requests")
@@ -1706,15 +1700,30 @@ class BulkAPITrigger:
                             try:
                                 result = future.result()
                                 # contract: dict with `_retry_in` means retryable transient
+                                # Retry contract: dict with '_retry_in' schedules another attempt
                                 if isinstance(result, dict) and (result.get('_retry_in') is not None):
-                                    delay = float(result.get('_retry_in', 0.0))
-                                    attempt_val = int(result.get('attempt', 0))
-                                    next_backoff = float(result.get('_next_backoff', self.config.get('retry', {}).get('retry_delay', 1.0)))
+                                    # Parse defensively
+                                    retry_hint = result.get('_retry_in')
+                                    try:
+                                        delay = float(retry_hint)
+                                    except (TypeError, ValueError):
+                                        delay = 0.0
+                                    try:
+                                        attempt_val = int(result.get('attempt', 0))
+                                    except (TypeError, ValueError):
+                                        attempt_val = 0
+                                    try:
+                                        next_backoff = float(result.get('_next_backoff', self.config.get('retry', {}).get('retry_delay', 1.0)))
+                                    except (TypeError, ValueError):
+                                        next_backoff = float(self.config.get('retry', {}).get('retry_delay', 1.0))
+
+                                    # Bound delay to reasonable range
+                                    delay = min(MAX_BACKOFF_SECONDS, max(0.1, delay))
                                     max_retries_cfg = int(self.config.get('retry', {}).get('max_retries', 3))
 
                                     if attempt_val < max_retries_cfg and not SHUTDOWN_EVENT.is_set():
                                         _seq += 1
-                                        heapq.heappush(retry_heap, (time.time() + max(0.0, delay), _seq, webhook, attempt_val, next_backoff))
+                                        heapq.heappush(retry_heap, (time.time() + delay, _seq, webhook, attempt_val, next_backoff))
                                     else:
                                         # exhausted retries — finalize as failure
                                         error_window.append(1)
@@ -1760,7 +1769,17 @@ class BulkAPITrigger:
                                     and os.getenv("SLACK_NOTIFY_PROGRESS", "false").lower() == "true"
                                 ):
                                     every_n = int(os.getenv("SLACK_PROGRESS_EVERY_N", "25"))
-                                    if processed_count % every_n == 0 or processed_count == 1:
+                                    first_at_n = int(os.getenv("SLACK_PROGRESS_FIRST_AT_N", "10"))
+                                    min_pct = float(os.getenv("SLACK_PROGRESS_MIN_PCT", "5"))
+                                    pct_done = (processed_count / max(1, total_requests)) * 100.0
+
+                                    should_send = (
+                                        processed_count >= first_at_n
+                                        and pct_done >= min_pct
+                                        and (processed_count % every_n == 0 or processed_count == total_requests)
+                                    )
+
+                                    if should_send:
                                         urgency = os.getenv("SLACK_PROGRESS_URGENCY", "auto")
                                         if urgency == "auto":
                                             urgency = _slack_urgency_for_progress(successful_count, processed_count)
@@ -1768,7 +1787,7 @@ class BulkAPITrigger:
                                             f"⏳ *{job_name}* in progress\n"
                                             f"{processed_count}/{total_requests} processed\n"
                                             f"✅ {successful_count} success | ❌ {failed_count} failed\n"
-                                            f"~{(processed_count/total_requests*100):.1f}% done"
+                                            f"~{pct_done:.1f}% done"
                                         )
                                         try:
                                             self.notification_manager.send_slack_notification(msg, urgency)
@@ -1811,9 +1830,12 @@ class BulkAPITrigger:
             self.db_manager.finish_job(job_id, successful_count, failed_count)
             results_tracker.save_results()
 
-            # Archive processed (single-file mode)
-            if csv_files and csv_files[0] != "AUTO":
-                archive_processed_file(csv_files[0], self.config)
+            # Archive processed (single-file mode, including CSV_FILE from env)
+            try:
+                if csv_file_path and os.path.isfile(csv_file_path):
+                    archive_processed_file(csv_file_path, self.config)
+            except Exception as _e:
+                logger.debug(f"Archive check skipped: {type(_e).__name__}: {_e}")
 
             # Summary
             job_stats = self.db_manager.get_job_stats(job_id)

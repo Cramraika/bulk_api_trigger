@@ -46,7 +46,7 @@ services:
       # Database
       - DATABASE_ENABLED=true
       - DATABASE_PATH=/app/data/webhook_results.db
-      - DATABASE_BACKUP=true
+      - DATABASE_BACKUP_ENABLED=true
       - DATABASE_BACKUP_INTERVAL_HOURS=24
       
       # Health & Metrics
@@ -73,7 +73,7 @@ services:
       
     # Enhanced health check
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health", "||", "exit", "1"]
+      test: ["CMD-SHELL", "curl", "-f", "http://localhost:8000/health", "||", "exit", "1"]
       interval: 30s
       timeout: 10s
       retries: 3
