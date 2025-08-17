@@ -447,6 +447,7 @@ class NotificationManager:
 
     def send_email_notification(self, subject: str, body: str, to_emails: List[str]):
         if not self.email_config.get('enabled', False):
+            logger.debug("Email notifications disabled in config; skipping send")
             return
         max_retries = 3
         for attempt in range(max_retries):
@@ -479,6 +480,7 @@ class NotificationManager:
 
     def send_slack_notification(self, message: str, urgency: str = 'normal'):
         if not self.slack_config.get('enabled', False):
+            logger.debug("Slack notifications disabled in config; skipping send")
             return
         try:
             emoji_map = {'low': '🔵','normal': '🟢','high': '🟡','critical': '🔴'}
@@ -1334,35 +1336,44 @@ class BulkAPITrigger:
                 self.db_manager.save_metric('job_success_rate', success_rate)
                 self.db_manager.save_metric('job_duration', job_stats.get('duration_seconds', 0))
                 self.db_manager.save_metric('job_throughput', metrics['throughput'])
-                # --- NEW: Always write a JSON job report to disk ---
-                try:
-                    report_path = write_job_json_report(
-                        db_manager=self.db_manager,
-                        job_id=job_id,
-                        job_name=job_name,
-                        csv_file_path=csv_file_path,
-                        total_requests=total_requests,
-                        successful_count=successful_count,
-                        failed_count=failed_count,
-                        metrics=metrics,
-                        extra_stats=stats,  # includes combined file stats in multi-file mode
-                    )
-                    logger.info(f"📝 Job report written: {report_path}")
-                    
-                    # Optional: ping Slack with a summary + path (no file upload, just a link/path)
-                    if (
-                        self.notification_manager.slack_config.get('enabled')
-                        and os.getenv("SLACK_NOTIFY_COMPLETION", "true").lower() == "true"
-                    ):
-                        try:
-                            self.notification_manager.send_slack_notification(
-                                f"📝 Job *{job_name}* report saved:\n{report_path}",
-                                'low'
-                            )
-                        except Exception:
-                            pass
-                except Exception as _e:
-                    logger.error(f"Failed to write job JSON report: {_e}")
+            # Write JSON report
+                            # --- NEW: Always write a JSON job report to disk (honor ENV/Config path) ---
+            try:
+                report_dir = (
+                    self.config.get('deployment', {}).get('report_path')
+                    or os.getenv('REPORT_PATH')
+                    or os.getenv('report_path')
+                    or '/app/data/reports'
+                )
+
+                report_path = write_job_json_report(
+                    db_manager=self.db_manager,
+                    job_id=job_id,
+                    job_name=job_name,
+                    csv_file_path=csv_file_path,
+                    total_requests=total_requests,
+                    successful_count=successful_count,
+                    failed_count=failed_count,
+                    metrics=metrics,
+                    extra_stats=stats,
+                    out_dir=report_dir,  # <— key change
+                )
+                logger.info(f"📝 Job report written: {report_path}")
+
+                if (
+                    self.notification_manager.slack_config.get('enabled')
+                    and os.getenv("SLACK_NOTIFY_COMPLETION", "true").lower() == "true"
+                ):
+                    try:
+                        self.notification_manager.send_slack_notification(
+                            f"📝 Job *{job_name}* report saved:\n{report_path}",
+                            'low'
+                        )
+                    except Exception:
+                        pass
+            except Exception as _e:
+                logger.error(f"Failed to write job JSON report: {_e}")
+
 
 
             return job_id
@@ -1843,7 +1854,8 @@ def load_environment_config():
             'skip_rows': int(os.getenv('SKIP_ROWS', '0')),
             'job_name': os.getenv('JOB_NAME', None),
             'metrics_enabled': os.getenv('METRICS_ENABLED', 'true').lower() == 'true',
-            'health_check_enabled': os.getenv('HEALTH_CHECK_ENABLED', 'true').lower() == 'true'
+            'health_check_enabled': os.getenv('HEALTH_CHECK_ENABLED', 'true').lower() == 'true',
+            'report_path': os.getenv('REPORT_PATH', os.getenv('report_path', '/app/data/reports')),
         },
         'notifications': {
             'email': {
@@ -1946,14 +1958,21 @@ def main():
         for config_file in ['config.yaml', 'config.yml', 'config.json']:
             if os.path.exists(config_file):
                 file_config = ConfigManager.load_config_file(config_file)
-                def merge_configs(base, override):
-                    for key, value in override.items():
-                        if key in base and isinstance(base[key], dict) and isinstance(value, dict):
-                            merge_configs(base[key], value)
+
+                # Merge helper: dst <- src (src overwrites dst)
+                def _deep_merge(dst, src):
+                    for k, v in (src or {}).items():
+                        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                            _deep_merge(dst[k], v)
                         else:
-                            base[key] = value
-                merge_configs(config, file_config)
-                logger.info(f"📋 Loaded additional config from {config_file}")
+                            dst[k] = v
+
+                # Start from file as defaults, then apply ENV on top so ENV wins
+                merged = dict(file_config or {})
+                _deep_merge(merged, config)   # config is your ENV-based dict from load_environment_config()
+                config = merged
+
+                logger.info(f"📋 Loaded additional config from {config_file} (ENV overrides file)")
                 break
         logger.info(f"⚙️  Configuration loaded successfully")
         logger.debug(f"Config details: {json.dumps(config, indent=2, default=str)}")

@@ -29,13 +29,11 @@ notifications:
       - admin@example.com
       - team@example.com
     notify_on_completion: true
-    notify_on_errors: true
 
   slack:
     enabled: false
     webhook_url: https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
     notify_on_completion: true
-    notify_on_errors: true
 
 # Database settings
 database:
