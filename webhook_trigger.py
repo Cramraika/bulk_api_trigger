@@ -33,6 +33,44 @@ import traceback
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 
+# Webhook rate limiting
+from collections import defaultdict
+import time
+
+class WebhookRateLimiter:
+    def __init__(self, max_requests_per_minute=60):
+        self.max_requests = max_requests_per_minute
+        self.requests = defaultdict(list)
+        self.lock = Lock()
+    
+    def is_allowed(self, client_ip: str) -> bool:
+        with self.lock:
+            now = time.time()
+            minute_ago = now - 60
+            
+            # Clean old requests
+            self.requests[client_ip] = [t for t in self.requests[client_ip] if t > minute_ago]
+            
+            # Check rate limit
+            if len(self.requests[client_ip]) >= self.max_requests:
+                return False
+            
+            # Record this request
+            self.requests[client_ip].append(now)
+            return True
+    
+    def get_reset_time(self, client_ip: str) -> int:
+        with self.lock:
+            if not self.requests[client_ip]:
+                return 0
+            oldest = min(self.requests[client_ip])
+            return int(oldest + 60)
+
+# Global rate limiter instance
+webhook_rate_limiter = WebhookRateLimiter(
+    max_requests_per_minute=int(os.getenv('WEBHOOK_RATE_LIMIT', '60'))
+)
+
 # ---------- Logging ----------
 def setup_logging():
     """Setup enhanced logging with rotation (robust, UTF-8, single-init, flush on exit)."""
@@ -46,7 +84,6 @@ def setup_logging():
     
     globals()['_logging_initialized'] = True
 
-    # Avoid duplicate handlers if setup_logging() is ever called twice.
     # Avoid duplicate handlers if setup_logging() is ever called twice.
     root_logger = logging.getLogger()
     if getattr(root_logger, "_already_configured", False):
@@ -111,6 +148,24 @@ def setup_logging():
     return lg
 
 logger = setup_logging()
+
+# Webhook-specific logger
+webhook_logger = logging.getLogger('webhook')
+webhook_logger.setLevel(logging.INFO)
+
+def log_webhook_trigger(endpoint: str, data: Dict, response_code: int, client_addr: str = None):
+    """Log webhook trigger events"""
+    try:
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'endpoint': endpoint,
+            'client': client_addr,
+            'request': data,
+            'response_code': response_code
+        }
+        webhook_logger.info(f"Webhook trigger: {json.dumps(log_entry)}")
+    except Exception as e:
+        logger.error(f"Failed to log webhook event: {e}")
 
 # Constants
 DEFAULT_DEBOUNCE_DELAY = 3.0
@@ -182,33 +237,69 @@ def _redact_headers(h: Dict[str, str]) -> Dict[str, str]:
     return redacted
 
 def _resume_marker_path(file_path: str, file_hash: str, config: Dict = None) -> str:
+    # Priority: resume config > deployment config > env > default
     base_dir = (
-        (config or {}).get('deployment', {}).get('report_path')
+        (config or {}).get('resume', {}).get('marker_path')
+        or (config or {}).get('deployment', {}).get('report_path')
+        or os.getenv('RESUME_MARKER_PATH')
         or os.getenv('REPORT_PATH')
         or '/app/data/reports'
     )
     os.makedirs(base_dir, exist_ok=True)
     base = os.path.basename(file_path).replace('/', '_').replace('\\', '_')
-    return os.path.join(base_dir, f".resume_{file_hash}_{base}.json")
+    safe_hash = file_hash[:16] if file_hash else 'unknown'  # Use first 16 chars of hash
+    return os.path.join(base_dir, f".resume_{safe_hash}_{base}.json")
 
 def _load_resume_rows(file_path: str, file_hash: str, config: Dict = None) -> int:
     try:
         p = _resume_marker_path(file_path, file_hash, config)
         if not os.path.exists(p):
             return 0
+        
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return int(data.get("skip_rows") or 0)
-    except Exception:
+        
+        # Validate the resume data
+        stored_hash = data.get("file_hash", "")
+        if stored_hash and stored_hash != file_hash:
+            logger.warning(f"Resume marker hash mismatch for {file_path}, clearing marker")
+            _clear_resume_marker(file_path, file_hash, config)
+            return 0
+        
+        skip_rows = int(data.get("skip_rows", 0))
+        last_checkpoint = data.get("last_checkpoint")
+        
+        # Check if checkpoint is too old (configurable, default 7 days)
+        if last_checkpoint:
+            try:
+                checkpoint_time = datetime.fromisoformat(last_checkpoint)
+                max_age_days = int(os.getenv('RESUME_MAX_AGE_DAYS', '7'))
+                if (datetime.now() - checkpoint_time).days > max_age_days:
+                    logger.warning(f"Resume marker too old ({last_checkpoint}), ignoring")
+                    return 0
+            except Exception:
+                pass
+        
+        logger.info(f"Loaded resume position {skip_rows} for {file_path} (checkpoint: {last_checkpoint})")
+        return max(0, skip_rows)
+    except Exception as e:
+        logger.error(f"Failed to load resume marker: {e}")
         return 0
 
 def _save_resume_rows(file_path: str, file_hash: str, skip_rows: int, config: Dict = None) -> None:
     try:
         p = _resume_marker_path(file_path, file_hash, config)
+        resume_data = {
+            "skip_rows": int(max(0, skip_rows)),
+            "file_path": file_path,
+            "file_hash": file_hash,
+            "last_checkpoint": datetime.now().isoformat(),
+            "total_rows": _count_csv_rows(file_path) if os.path.exists(file_path) else 0
+        }
         with open(p, "w", encoding="utf-8") as f:
-            json.dump({"skip_rows": int(max(0, skip_rows))}, f)
+            json.dump(resume_data, f, indent=2)
     except Exception as e:
-        logger.debug(f"Resume marker write failed for {file_path}: {e}")
+        logger.error(f"Resume marker write failed for {file_path}: {e}")
 
 def _clear_resume_marker(file_path: str, file_hash: str, config: Dict = None) -> None:
     try:
@@ -485,6 +576,18 @@ class DatabaseManager:
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS webhook_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    endpoint TEXT NOT NULL,
+                    client_ip TEXT,
+                    request_data TEXT,
+                    response_code INTEGER,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_webhook_timestamp ON webhook_metrics(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_webhook_endpoint ON webhook_metrics(endpoint)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_webhook_job_id ON webhook_results(job_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_webhook_timestamp ON webhook_results(timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_job_status ON job_history(status)')
@@ -1840,18 +1943,36 @@ class BulkAPITrigger:
                 files_count = (stats or {}).get('files_processed', 0) if isinstance(stats, dict) else 0
                 csv_file_path = f"Multiple files ({files_count} files)"
             resume_file_hash = ""
+            resume_enabled = self.config.get('resume', {}).get('enabled', True)
+            resume_checkpoint_interval = self.config.get('resume', {}).get('checkpoint_interval', 100)
+            
             try:
                 # Only meaningful if we are processing a single concrete file path
                 if csv_file_path and isinstance(csv_file_path, str) and os.path.isfile(csv_file_path):
                     resume_file_hash = _calculate_file_hash(csv_file_path) or ""
-                    # Load existing resume position if available
-                    if resume_file_hash and skip_rows == 0:
+                    
+                    # Load existing resume position if available and not explicitly skipping
+                    if resume_file_hash and skip_rows == 0 and resume_enabled:
                         existing_skip = _load_resume_rows(csv_file_path, resume_file_hash, self.config)
                         if existing_skip > 0:
-                            logger.info(f"🔄 Resuming from row {existing_skip} based on previous progress")
-                            skip_rows = existing_skip
+                            # Validate that resume position is valid
+                            total_rows_in_file = _count_csv_rows(csv_file_path)
+                            if existing_skip < total_rows_in_file:
+                                logger.info(f"🔄 Resuming from row {existing_skip}/{total_rows_in_file} based on previous progress")
+                                skip_rows = existing_skip
+                                
+                                # Adjust webhooks list if already loaded
+                                if all_webhooks and existing_skip > 0:
+                                    all_webhooks = all_webhooks[existing_skip:]
+                                    logger.info(f"Adjusted webhook list to start from position {existing_skip}")
+                            else:
+                                logger.warning(f"Resume position {existing_skip} >= total rows {total_rows_in_file}, starting from beginning")
+                                _clear_resume_marker(csv_file_path, resume_file_hash, self.config)
+                                skip_rows = 0
             except Exception as _e:
-                logger.debug(f"Resume hash compute skipped: {_e}")
+                logger.error(f"Resume initialization failed: {_e}")
+                # Continue without resume on error
+                resume_enabled = False
             if not all_webhooks:
                 # Be explicit to avoid downstream division by zero or progress at 1%
                 message = f"🟡 No valid rows found in {csv_file_path}; skipping job {job_id}."
@@ -2022,12 +2143,15 @@ class BulkAPITrigger:
                                 if pbar:
                                     pbar.update(1)
                                 rate_limiter.tick()
-                                if resume_file_hash and (processed_count % 500 == 0):
+                                # Save resume checkpoint at configured interval
+                                if resume_file_hash and resume_enabled and (processed_count % resume_checkpoint_interval == 0):
                                     try:
                                         # 'skip_rows' is the caller-provided initial skip; add what we've finished now
-                                        _save_resume_rows(csv_file_path, resume_file_hash, skip_rows + processed_count, self.config)
+                                        checkpoint_position = skip_rows + processed_count
+                                        _save_resume_rows(csv_file_path, resume_file_hash, checkpoint_position, self.config)
+                                        logger.debug(f"Resume checkpoint saved at position {checkpoint_position}")
                                     except Exception as _e:
-                                        logger.debug(f"Resume marker save skipped: {_e}")
+                                        logger.error(f"Resume checkpoint save failed: {_e}")
 
                                 # periodic progress logging
                                 PROGRESS_EVERY_N = int(os.getenv("PROGRESS_EVERY_N", "50"))
@@ -2408,7 +2532,44 @@ def create_health_check_server():
                 super().__init__(*args, **kwargs)
 
             def do_GET(self):
-                if self.path == '/health' or self.path == '/':
+                if self.path == '/':
+                    # Return API documentation
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    docs = {
+                        'service': 'Bulk API Trigger Platform',
+                        'version': '2.0',
+                        'endpoints': {
+                            'GET /health': 'Health check and system status',
+                            'GET /jobs': 'List recent jobs',
+                            'GET /jobs/{job_id}': 'Get job details',
+                            'GET /jobs/{job_id}/errors': 'Get job errors',
+                            'GET /jobs/{job_id}/report': 'Get job report',
+                            'GET /metrics': 'System metrics',
+                            'GET /config': 'Current configuration',
+                            'POST /trigger': 'Trigger a new job',
+                            'POST /resume/status': 'Get resume status for a file',
+                            'POST /resume/clear': 'Clear resume marker for a file'
+                        },
+                        'webhook_endpoint': {
+                            'url': 'POST /trigger',
+                            'payload': {
+                                'csv_file': 'Path to CSV file (required)',
+                                'job_name': 'Custom job name (optional)',
+                                'skip_rows': 'Number of rows to skip (optional, default: 0)',
+                                'resume': 'Enable resume from last checkpoint (optional, default: true)',
+                                'force_restart': 'Force restart from beginning (optional, default: false)'
+                            },
+                            'example': {
+                                'csv_file': '/app/data/csv/webhooks.csv',
+                                'job_name': 'My Custom Job',
+                                'resume': True
+                            }
+                        }
+                    }
+                    self.wfile.write(json.dumps(docs, indent=2).encode())
+                elif self.path == '/health':
                     status = self.trigger.get_system_status()
                     if status['database_accessible'] and (not status['watchdog_enabled'] or status['watchdog_running']):
                         self.send_response(200)
@@ -2532,6 +2693,700 @@ def create_health_check_server():
                         metrics = {'error': str(e)}
                     self.wfile.write(json.dumps(metrics, indent=2).encode())
 
+                elif self.path == '/status':
+                    # Get status of all active and recent jobs
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    try:
+                        with self.trigger.db_manager.get_connection() as conn:
+                            cur = conn.cursor()
+                            # Get running jobs
+                            cur.execute("""
+                                SELECT job_id, job_name, csv_file, total_requests, 
+                                       successful_requests, failed_requests, status, 
+                                       start_time, triggered_by
+                                FROM job_history
+                                WHERE status = 'running'
+                                ORDER BY start_time DESC
+                            """)
+                            running = []
+                            for row in cur.fetchall():
+                                running.append({
+                                    'job_id': row[0],
+                                    'job_name': row[1],
+                                    'csv_file': row[2],
+                                    'total': row[3],
+                                    'processed': (row[4] or 0) + (row[5] or 0),
+                                    'successful': row[4] or 0,
+                                    'failed': row[5] or 0,
+                                    'status': row[6],
+                                    'start_time': row[7],
+                                    'triggered_by': row[8]
+                                })
+                            
+                            # Get inflight files
+                            with self.trigger.inflight_lock:
+                                inflight = list(self.trigger.inflight_files)
+                            
+                            # Get queue size
+                            try:
+                                queue_size = self.trigger.job_queue.qsize()
+                            except:
+                                queue_size = 0
+                            
+                            status = {
+                                'running_jobs': running,
+                                'inflight_files': inflight,
+                                'queue_size': queue_size,
+                                'watchdog_enabled': self.trigger.watchdog_enabled,
+                                'timestamp': datetime.now().isoformat()
+                            }
+                    except Exception as e:
+                        status = {'error': str(e)}
+                    self.wfile.write(json.dumps(status, indent=2, default=str).encode())
+
+                elif self.path == '/config':
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    try:
+                        cfg = dict(self.trigger.config)  # shallow copy
+                        # redact secrets
+                        try:
+                            if 'notifications' in cfg and 'email' in cfg['notifications']:
+                                cfg['notifications']['email'] = dict(cfg['notifications']['email'])
+                                if 'password' in cfg['notifications']['email']:
+                                    cfg['notifications']['email']['password'] = '***REDACTED***'
+                            if 'notifications' in cfg and 'slack' in cfg['notifications']:
+                                cfg['notifications']['slack'] = dict(cfg['notifications']['slack'])
+                                if 'webhook_url' in cfg['notifications']['slack']:
+                                    cfg['notifications']['slack']['webhook_url'] = '***REDACTED***'
+                        except Exception:
+                            pass
+                        self.wfile.write(json.dumps(cfg, indent=2, default=str).encode())
+                    except Exception as e:
+                        self.wfile.write(json.dumps({'error': str(e)}).encode())
+
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            
+            def _check_auth(self):
+                """Check authentication if enabled"""
+                webhook_auth = os.getenv('WEBHOOK_AUTH_TOKEN')
+                if not webhook_auth:
+                    return True  # No auth configured
+                
+                auth_header = self.headers.get('Authorization', '')
+                if auth_header.startswith('Bearer '):
+                    token = auth_header[7:]
+                    return token == webhook_auth
+                return False
+            
+            def do_POST(self):
+                # Check authentication for webhook endpoints
+                if self.path in ['/trigger', '/trigger/batch', '/resume/clear']:
+                    if not self._check_auth():
+                        self.send_response(401)
+                        self.send_header('Content-type', 'application/json')
+                        self.send_header('WWW-Authenticate', 'Bearer')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'error': 'Unauthorized'}).encode())
+                        return
+
+            def do_POST(self):
+                if self.path in ['/trigger', '/trigger/batch', '/resume/clear']:
+                    try:
+                        content_length = int(self.headers.get('Content-Length', 0))
+                        if content_length > 104857600:  # 100MB limit
+                            self.send_response(413)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': 'Request too large'}).encode())
+                            return
+                        
+                        post_data = self.rfile.read(content_length)
+                        data = json.loads(post_data.decode('utf-8'))
+                        
+                        # Validate required fields
+                        csv_file = data.get('csv_file')
+                        if not csv_file:
+                            self.send_response(400)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': 'csv_file is required'}).encode())
+                            return
+                        
+                        # Check if file exists
+                        if not os.path.exists(csv_file):
+                            self.send_response(404)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': f'CSV file not found: {csv_file}'}).encode())
+                            return
+                        
+                        # Extract optional parameters
+                        job_name = data.get('job_name', f'API Triggered - {os.path.basename(csv_file)}')
+                        skip_rows = int(data.get('skip_rows', 0))
+                        resume = data.get('resume', True)  # Default to resume enabled
+                        force_restart = data.get('force_restart', False)  # Force restart from beginning
+                        
+                        # Clear resume marker if force_restart
+                        if force_restart and resume:
+                            try:
+                                file_hash = _calculate_file_hash(csv_file)
+                                if file_hash:
+                                    _clear_resume_marker(csv_file, file_hash, self.trigger.config)
+                                    skip_rows = 0
+                            except Exception as e:
+                                logger.warning(f"Failed to clear resume marker: {e}")
+                        
+                        # Check if job is already running for this file
+                        with self.trigger.inflight_lock:
+                            if csv_file in self.trigger.inflight_files:
+                                self.send_response(409)
+                                self.send_header('Content-type', 'application/json')
+                                self.end_headers()
+                                self.wfile.write(json.dumps({
+                                    'error': 'Job already running for this file',
+                                    'file': csv_file
+                                }).encode())
+                                return
+                            self.trigger.inflight_files.add(csv_file)
+                        
+                        # Trigger the job asynchronously
+                        def run_job():
+                            try:
+                                job_id = self.trigger.trigger_webhooks(
+                                    csv_files=[csv_file],
+                                    job_name=job_name,
+                                    skip_rows=skip_rows,
+                                    triggered_by='webhook'
+                                )
+                                logger.info(f"Webhook triggered job {job_id} for {csv_file}")
+                            finally:
+                                with self.trigger.inflight_lock:
+                                    self.trigger.inflight_files.discard(csv_file)
+                        
+                        job_thread = Thread(target=run_job, daemon=True)
+                        job_thread.start()
+                        
+                        # Return immediate response
+                        log_webhook_trigger(
+                            '/trigger',
+                            {'csv_file': csv_file, 'job_name': job_name},
+                            202,
+                            self.client_address[0] if self.client_address else None
+                        )
+                        self.send_response(202)  # Accepted
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        response = {
+                            'status': 'accepted',
+                            'message': 'Job queued for processing',
+                            'csv_file': csv_file,
+                            'job_name': job_name,
+                            'resume_enabled': resume and not force_restart
+                        }
+                        self.wfile.write(json.dumps(response).encode())
+                    
+                    except json.JSONDecodeError:
+                        self.send_response(400)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'error': 'Invalid JSON'}).encode())
+                    except Exception as e:
+                        logger.error(f"Webhook endpoint error: {e}")
+                        self.send_response(500)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'error': str(e)}).encode())
+                
+                elif self.path == '/trigger/batch':
+                    # Trigger multiple CSV files
+                    try:
+                        content_length = int(self.headers.get('Content-Length', 0))
+                        if content_length > 104857600:  # 100MB limit
+                            self.send_response(413)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': 'Request too large'}).encode())
+                            return
+                        
+                        post_data = self.rfile.read(content_length)
+                        data = json.loads(post_data.decode('utf-8'))
+                        
+                        # Validate required fields
+                        csv_files = data.get('csv_files', [])
+                        if not csv_files or not isinstance(csv_files, list):
+                            self.send_response(400)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': 'csv_files array is required'}).encode())
+                            return
+                        
+                        # Validate all files exist
+                        missing_files = [f for f in csv_files if not os.path.exists(f)]
+                        if missing_files:
+                            self.send_response(404)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({
+                                'error': 'Some CSV files not found',
+                                'missing_files': missing_files
+                            }).encode())
+                            return
+                        
+                        # Queue all files
+                        queued_files = []
+                        skipped_files = []
+                        
+                        for csv_file in csv_files[:100]:  # Limit to 100 files
+                            with self.trigger.inflight_lock:
+                                if csv_file in self.trigger.inflight_files:
+                                    skipped_files.append({'file': csv_file, 'reason': 'already running'})
+                                    continue
+                                self.trigger.inflight_files.add(csv_file)
+                            
+                            # Queue the file
+                            file_hash = _calculate_file_hash(csv_file)
+                            job_info = {
+                                'csv_file': csv_file,
+                                'file_hash': file_hash,
+                                'file_size': os.path.getsize(csv_file),
+                                'row_count': _count_csv_rows(csv_file),
+                                'event_type': 'webhook_batch',
+                                'detected_at': datetime.now().isoformat()
+                            }
+                            
+                            try:
+                                self.trigger.job_queue.put_nowait(job_info)
+                                queued_files.append(csv_file)
+                            except queue.Full:
+                                with self.trigger.inflight_lock:
+                                    self.trigger.inflight_files.discard(csv_file)
+                                skipped_files.append({'file': csv_file, 'reason': 'queue full'})
+                        
+                        self.send_response(202)  # Accepted
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        response = {
+                            'status': 'accepted',
+                            'queued_files': queued_files,
+                            'skipped_files': skipped_files,
+                            'total_queued': len(queued_files),
+                            'total_skipped': len(skipped_files)
+                        }
+                        self.wfile.write(json.dumps(response).encode())
+                    
+                    except Exception as e:
+                        logger.error(f"Batch trigger error: {e}")
+                        self.send_response(500)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'error': str(e)}).encode())
+
+                elif self.path == '/resume/status':
+                    # Get resume status for a file
+                    try:
+                        content_length = int(self.headers.get('Content-Length', 0))
+                        post_data = self.rfile.read(content_length)
+                        data = json.loads(post_data.decode('utf-8'))
+                        
+                        csv_file = data.get('csv_file')
+                        if not csv_file:
+                            self.send_response(400)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': 'csv_file is required'}).encode())
+                            return
+                        
+                        file_hash = _calculate_file_hash(csv_file)
+                        resume_rows = _load_resume_rows(csv_file, file_hash, self.trigger.config) if file_hash else 0
+                        total_rows = _count_csv_rows(csv_file)
+                        
+                        response = {
+                            'csv_file': csv_file,
+                            'file_hash': file_hash,
+                            'resume_position': resume_rows,
+                            'total_rows': total_rows,
+                            'progress_percentage': (resume_rows / total_rows * 100) if total_rows > 0 else 0,
+                            'is_complete': resume_rows >= total_rows if total_rows > 0 else False
+                        }
+                        
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps(response).encode())
+                    
+                    except Exception as e:
+                        self.send_response(500)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'error': str(e)}).encode())
+                
+                elif self.path == '/resume/clear':
+                    # Clear resume marker for a file
+                    try:
+                        content_length = int(self.headers.get('Content-Length', 0))
+                        post_data = self.rfile.read(content_length)
+                        data = json.loads(post_data.decode('utf-8'))
+                        
+                        csv_file = data.get('csv_file')
+                        if not csv_file:
+                            self.send_response(400)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': 'csv_file is required'}).encode())
+                            return
+                        
+                        file_hash = _calculate_file_hash(csv_file)
+                        if file_hash:
+                            _clear_resume_marker(csv_file, file_hash, self.trigger.config)
+                        
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            'status': 'success',
+                            'message': 'Resume marker cleared',
+                            'csv_file': csv_file
+                        }).encode())
+                    
+                    except Exception as e:
+                        self.send_response(500)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'error': str(e)}).encode())
+                
+                else:
+                    self.send_response(404)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'error': 'Endpoint not found'}).encode())
+
+            def do_OPTIONS(self):
+                # Handle CORS preflight requests
+                self.send_response(200)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+                self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+                self.send_header('Access-Control-Max-Age', '3600')
+                self.end_headers()
+            
+            def end_headers(self):
+                # Add CORS headers to all responses
+                self.send_header('Access-Control-Allow-Origin', '*')
+                super().end_headers()
+
+            def log_message(self, format, *args):
+                pass  # Suppress default logging
+
+        def start_server(trigger_instance, port=8000):
+            HealthCheckHandler.trigger = trigger_instance
+            server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+            server.serve_forever()
+
+        def stop_server(server):
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception as e:
+                logger.error(f"Error stopping health server: {e}")
+        
+        return start_server, stop_server
+
+    except ImportError:
+        logger.warning("HTTP server not available, health checks disabled")
+        return None
+def create_health_check_server():
+    """Create a simple health check HTTP server with webhook endpoints"""
+    try:
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        import json
+        import queue
+        from threading import Thread
+        from datetime import datetime
+        import os
+        import time
+
+        class HealthCheckHandler(BaseHTTPRequestHandler):
+            trigger = None
+            
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+
+            def _check_auth(self):
+                """Check authentication if enabled"""
+                webhook_auth = os.getenv('WEBHOOK_AUTH_TOKEN')
+                if not webhook_auth:
+                    return True  # No auth configured
+                
+                auth_header = self.headers.get('Authorization', '')
+                if auth_header.startswith('Bearer '):
+                    token = auth_header[7:]
+                    return token == webhook_auth
+                return False
+
+            def do_GET(self):
+                if self.path == '/':
+                    # Return API documentation
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    docs = {
+                        'service': 'Bulk API Trigger Platform',
+                        'version': '2.0',
+                        'endpoints': {
+                            'GET /health': 'Health check and system status',
+                            'GET /jobs': 'List recent jobs',
+                            'GET /jobs/{job_id}': 'Get job details',
+                            'GET /jobs/{job_id}/errors': 'Get job errors',
+                            'GET /jobs/{job_id}/report': 'Get job report',
+                            'GET /metrics': 'System metrics',
+                            'GET /config': 'Current configuration',
+                            'GET /status': 'Status of all active and recent jobs',
+                            'GET /resume/stats': 'Resume statistics across all files',
+                            'POST /trigger': 'Trigger a new job',
+                            'POST /trigger/batch': 'Trigger multiple CSV files',
+                            'POST /resume/status': 'Get resume status for a file',
+                            'POST /resume/clear': 'Clear resume marker for a file'
+                        },
+                        'webhook_endpoint': {
+                            'url': 'POST /trigger',
+                            'payload': {
+                                'csv_file': 'Path to CSV file (required)',
+                                'job_name': 'Custom job name (optional)',
+                                'skip_rows': 'Number of rows to skip (optional, default: 0)',
+                                'resume': 'Enable resume from last checkpoint (optional, default: true)',
+                                'force_restart': 'Force restart from beginning (optional, default: false)'
+                            },
+                            'example': {
+                                'csv_file': '/app/data/csv/webhooks.csv',
+                                'job_name': 'My Custom Job',
+                                'resume': True
+                            }
+                        }
+                    }
+                    self.wfile.write(json.dumps(docs, indent=2).encode())
+                    
+                elif self.path == '/health':
+                    status = self.trigger.get_system_status()
+                    if status['database_accessible'] and (not status['watchdog_enabled'] or status['watchdog_running']):
+                        self.send_response(200)
+                        response_data = {
+                            'status': 'healthy',
+                            'system': status,
+                            'message': 'Bulk API Trigger is running normally'
+                        }
+                    else:
+                        self.send_response(503)
+                        response_data = {
+                            'status': 'unhealthy',
+                            'system': status,
+                            'message': 'System components not functioning properly'
+                        }
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps(response_data, indent=2).encode())
+
+                elif self.path.startswith('/jobs'):
+                    parts = [p for p in self.path.split('/') if p]
+                    if len(parts) == 1:  # /jobs
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        try:
+                            with self.trigger.db_manager.get_connection() as conn:
+                                cur = conn.cursor()
+                                cur.execute("""
+                                    SELECT job_id, job_name, total_requests, successful_requests, failed_requests,
+                                        start_time, end_time, duration_seconds, status
+                                    FROM job_history
+                                    WHERE status IN ('completed', 'failed', 'running')
+                                    ORDER BY start_time DESC
+                                    LIMIT 50
+                                """)
+                                rows = cur.fetchall()
+                                jobs = [{
+                                    "job_id": r[0], "job_name": r[1], "total": r[2],
+                                    "successful": r[3], "failed": r[4],
+                                    "start_time": r[5], "end_time": r[6],
+                                    "duration_seconds": r[7], "status": r[8],
+                                } for r in rows]
+                        except Exception as e:
+                            jobs = {"error": str(e)}
+                        self.wfile.write(json.dumps(jobs, indent=2, default=str).encode())
+
+                    elif len(parts) >= 2:
+                        job_id = parts[1]
+                        if len(parts) == 2:  # /jobs/<job_id>
+                            self.send_response(200)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            data = self.trigger.db_manager.get_job_stats(job_id)
+                            self.wfile.write(json.dumps(data, indent=2, default=str).encode())
+
+                        elif len(parts) == 3 and parts[2] == 'errors':  # /jobs/<job_id>/errors
+                            self.send_response(200)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            try:
+                                with self.trigger.db_manager.get_connection() as conn:
+                                    cur = conn.cursor()
+                                    cur.execute("""
+                                        SELECT url, method, status, status_code, error_message, timestamp
+                                        FROM webhook_results
+                                        WHERE job_id = ?
+                                          AND (status = 'error' OR status = 'exception')
+                                        ORDER BY timestamp DESC
+                                        LIMIT 50
+                                    """, (job_id,))
+                                    errs = [{
+                                        "url": r[0], "method": r[1], "status": r[2],
+                                        "status_code": r[3], "error_message": r[4], "timestamp": r[5]
+                                    } for r in cur.fetchall()]
+                            except Exception as e:
+                                errs = {"error": str(e)}
+                            self.wfile.write(json.dumps(errs, indent=2, default=str).encode())
+
+                        elif len(parts) == 3 and parts[2] == 'report':  # /jobs/<job_id>/report
+                            self.send_response(200)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            rpt_dir = self.trigger.config.get('deployment', {}).get('report_path', '/app/data/reports')
+                            path = os.path.join(rpt_dir, f"job_{job_id}.json")
+                            try:
+                                with open(path, "r", encoding="utf-8") as f:
+                                    content = json.load(f)
+                            except Exception as e:
+                                content = {"error": str(e), "path": path}
+                            self.wfile.write(json.dumps(content, indent=2, default=str).encode())
+
+                        else:
+                            self.send_response(404)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(b'{"error": "Invalid job endpoint"}')
+
+                elif self.path == '/metrics':
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    try:
+                        with self.trigger.db_manager.get_connection() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute('''
+                                SELECT COUNT(*) as total_jobs,
+                                       AVG(duration_seconds) as avg_duration,
+                                       AVG(CAST(successful_requests AS FLOAT) / total_requests * 100) as avg_success_rate
+                                FROM job_history 
+                                WHERE start_time >= datetime('now', '-24 hours')
+                            ''')
+                            row = cursor.fetchone()
+                            metrics = {
+                                'jobs_last_24h': row[0] if row[0] else 0,
+                                'avg_job_duration': round(row[1], 2) if row[1] else 0,
+                                'avg_success_rate': round(row[2], 2) if row[2] else 0,
+                                'timestamp': datetime.now().isoformat()
+                            }
+                    except Exception as e:
+                        metrics = {'error': str(e)}
+                    self.wfile.write(json.dumps(metrics, indent=2).encode())
+
+                elif self.path == '/status':
+                    # Get status of all active and recent jobs
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    try:
+                        with self.trigger.db_manager.get_connection() as conn:
+                            cur = conn.cursor()
+                            # Get running jobs
+                            cur.execute("""
+                                SELECT job_id, job_name, csv_file, total_requests, 
+                                       successful_requests, failed_requests, status, 
+                                       start_time, triggered_by
+                                FROM job_history
+                                WHERE status = 'running'
+                                ORDER BY start_time DESC
+                            """)
+                            running = []
+                            for row in cur.fetchall():
+                                running.append({
+                                    'job_id': row[0],
+                                    'job_name': row[1],
+                                    'csv_file': row[2],
+                                    'total': row[3],
+                                    'processed': (row[4] or 0) + (row[5] or 0),
+                                    'successful': row[4] or 0,
+                                    'failed': row[5] or 0,
+                                    'status': row[6],
+                                    'start_time': row[7],
+                                    'triggered_by': row[8]
+                                })
+                            
+                            # Get inflight files
+                            with self.trigger.inflight_lock:
+                                inflight = list(self.trigger.inflight_files)
+                            
+                            # Get queue size
+                            try:
+                                queue_size = self.trigger.job_queue.qsize()
+                            except:
+                                queue_size = 0
+                            
+                            status = {
+                                'running_jobs': running,
+                                'inflight_files': inflight,
+                                'queue_size': queue_size,
+                                'watchdog_enabled': self.trigger.watchdog_enabled,
+                                'timestamp': datetime.now().isoformat()
+                            }
+                    except Exception as e:
+                        status = {'error': str(e)}
+                    self.wfile.write(json.dumps(status, indent=2, default=str).encode())
+
+                elif self.path == '/resume/stats':
+                    # Get resume statistics across all files
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    try:
+                        resume_dir = (
+                            self.trigger.config.get('resume', {}).get('marker_path')
+                            or self.trigger.config.get('deployment', {}).get('report_path')
+                            or '/app/data/reports'
+                        )
+                        
+                        resume_files = []
+                        if os.path.exists(resume_dir):
+                            for f in os.listdir(resume_dir):
+                                if f.startswith('.resume_') and f.endswith('.json'):
+                                    try:
+                                        path = os.path.join(resume_dir, f)
+                                        with open(path, 'r') as rf:
+                                            data = json.load(rf)
+                                            resume_files.append({
+                                                'file': data.get('file_path', 'unknown'),
+                                                'position': data.get('skip_rows', 0),
+                                                'total': data.get('total_rows', 0),
+                                                'checkpoint': data.get('last_checkpoint', ''),
+                                                'progress': (data.get('skip_rows', 0) / data.get('total_rows', 1) * 100) if data.get('total_rows', 0) > 0 else 0
+                                            })
+                                    except Exception:
+                                        pass
+                        
+                        stats = {
+                            'resume_markers': len(resume_files),
+                            'files': sorted(resume_files, key=lambda x: x.get('checkpoint', ''), reverse=True)[:20],
+                            'resume_dir': resume_dir
+                        }
+                        self.wfile.write(json.dumps(stats, indent=2, default=str).encode())
+                    except Exception as e:
+                        self.wfile.write(json.dumps({'error': str(e)}).encode())
+
                 elif self.path == '/config':
                     self.send_response(200)
                     self.send_header('Content-type', 'application/json')
@@ -2558,6 +3413,348 @@ def create_health_check_server():
                     self.send_response(404)
                     self.end_headers()
 
+            def do_POST(self):
+                # Check authentication for webhook endpoints
+                if self.path in ['/trigger', '/trigger/batch', '/resume/clear']:
+                    if not self._check_auth():
+                        self.send_response(401)
+                        self.send_header('Content-type', 'application/json')
+                        self.send_header('WWW-Authenticate', 'Bearer')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'error': 'Unauthorized'}).encode())
+                        return
+                
+                # Check rate limiting for webhook endpoints
+                if self.path in ['/trigger', '/trigger/batch']:
+                    client_ip = self.client_address[0] if self.client_address else 'unknown'
+                    if not webhook_rate_limiter.is_allowed(client_ip):
+                        reset_time = webhook_rate_limiter.get_reset_time(client_ip)
+                        self.send_response(429)  # Too Many Requests
+                        self.send_header('Content-type', 'application/json')
+                        self.send_header('X-RateLimit-Reset', str(reset_time))
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            'error': 'Rate limit exceeded',
+                            'retry_after': reset_time - int(time.time())
+                        }).encode())
+                        return
+
+                if self.path == '/trigger':
+                    try:
+                        content_length = int(self.headers.get('Content-Length', 0))
+                        if content_length > 1048576:  # 1MB limit
+                            self.send_response(413)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': 'Request too large'}).encode())
+                            return
+                        
+                        post_data = self.rfile.read(content_length)
+                        data = json.loads(post_data.decode('utf-8'))
+                        
+                        # Validate required fields
+                        csv_file = data.get('csv_file')
+                        if not csv_file:
+                            self.send_response(400)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': 'csv_file is required'}).encode())
+                            return
+                        
+                        # Check if file exists
+                        if not os.path.exists(csv_file):
+                            self.send_response(404)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': f'CSV file not found: {csv_file}'}).encode())
+                            return
+                        
+                        # Validate file is actually a CSV
+                        if not csv_file.lower().endswith('.csv'):
+                            self.send_response(400)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': f'File must be a CSV: {csv_file}'}).encode())
+                            return
+                        
+                        # Validate file has valid content
+                        try:
+                            row_count = _count_csv_rows(csv_file)
+                            if row_count == 0:
+                                self.send_response(400)
+                                self.send_header('Content-type', 'application/json')
+                                self.end_headers()
+                                self.wfile.write(json.dumps({
+                                    'error': 'CSV file has no valid webhook URLs',
+                                    'file': csv_file
+                                }).encode())
+                                return
+                        except Exception as e:
+                            self.send_response(400)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({
+                                'error': f'Failed to validate CSV: {str(e)}',
+                                'file': csv_file
+                            }).encode())
+                            return
+                        
+                        # Extract optional parameters
+                        job_name = data.get('job_name', f'API Triggered - {os.path.basename(csv_file)}')
+                        skip_rows = int(data.get('skip_rows', 0))
+                        resume = data.get('resume', True)  # Default to resume enabled
+                        force_restart = data.get('force_restart', False)  # Force restart from beginning
+                        
+                        # Clear resume marker if force_restart
+                        if force_restart and resume:
+                            try:
+                                file_hash = _calculate_file_hash(csv_file)
+                                if file_hash:
+                                    _clear_resume_marker(csv_file, file_hash, self.trigger.config)
+                                    skip_rows = 0
+                            except Exception as e:
+                                logger.warning(f"Failed to clear resume marker: {e}")
+                        
+                        # Check if job is already running for this file
+                        with self.trigger.inflight_lock:
+                            if csv_file in self.trigger.inflight_files:
+                                self.send_response(409)
+                                self.send_header('Content-type', 'application/json')
+                                self.end_headers()
+                                self.wfile.write(json.dumps({
+                                    'error': 'Job already running for this file',
+                                    'file': csv_file
+                                }).encode())
+                                return
+                            self.trigger.inflight_files.add(csv_file)
+                        
+                        # Trigger the job asynchronously
+                        def run_job():
+                            try:
+                                job_id = self.trigger.trigger_webhooks(
+                                    csv_files=[csv_file],
+                                    job_name=job_name,
+                                    skip_rows=skip_rows,
+                                    triggered_by='webhook'
+                                )
+                                logger.info(f"Webhook triggered job {job_id} for {csv_file}")
+                            finally:
+                                with self.trigger.inflight_lock:
+                                    self.trigger.inflight_files.discard(csv_file)
+                        
+                        job_thread = Thread(target=run_job, daemon=True)
+                        job_thread.start()
+                        
+                        # Log the webhook trigger
+                        log_webhook_trigger(
+                            '/trigger',
+                            {'csv_file': csv_file, 'job_name': job_name},
+                            202,
+                            self.client_address[0] if self.client_address else None
+                        )
+                        
+                        # Return immediate response
+                        self.send_response(202)  # Accepted
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        response = {
+                            'status': 'accepted',
+                            'message': 'Job queued for processing',
+                            'csv_file': csv_file,
+                            'job_name': job_name,
+                            'resume_enabled': resume and not force_restart
+                        }
+                        self.wfile.write(json.dumps(response).encode())
+                    
+                    except json.JSONDecodeError:
+                        self.send_response(400)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'error': 'Invalid JSON'}).encode())
+                    except Exception as e:
+                        logger.error(f"Webhook endpoint error: {e}")
+                        self.send_response(500)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'error': str(e)}).encode())
+                
+                elif self.path == '/trigger/batch':
+                    # Trigger multiple CSV files
+                    try:
+                        content_length = int(self.headers.get('Content-Length', 0))
+                        if content_length > 1048576:  # 1MB limit
+                            self.send_response(413)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': 'Request too large'}).encode())
+                            return
+                        
+                        post_data = self.rfile.read(content_length)
+                        data = json.loads(post_data.decode('utf-8'))
+                        
+                        # Validate required fields
+                        csv_files = data.get('csv_files', [])
+                        if not csv_files or not isinstance(csv_files, list):
+                            self.send_response(400)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': 'csv_files array is required'}).encode())
+                            return
+                        
+                        # Validate all files exist
+                        missing_files = [f for f in csv_files if not os.path.exists(f)]
+                        if missing_files:
+                            self.send_response(404)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({
+                                'error': 'Some CSV files not found',
+                                'missing_files': missing_files
+                            }).encode())
+                            return
+                        
+                        # Queue all files
+                        queued_files = []
+                        skipped_files = []
+                        
+                        for csv_file in csv_files[:100]:  # Limit to 100 files
+                            with self.trigger.inflight_lock:
+                                if csv_file in self.trigger.inflight_files:
+                                    skipped_files.append({'file': csv_file, 'reason': 'already running'})
+                                    continue
+                                self.trigger.inflight_files.add(csv_file)
+                            
+                            # Queue the file
+                            file_hash = _calculate_file_hash(csv_file)
+                            job_info = {
+                                'csv_file': csv_file,
+                                'file_hash': file_hash,
+                                'file_size': os.path.getsize(csv_file),
+                                'row_count': _count_csv_rows(csv_file),
+                                'event_type': 'webhook_batch',
+                                'detected_at': datetime.now().isoformat()
+                            }
+                            
+                            try:
+                                self.trigger.job_queue.put_nowait(job_info)
+                                queued_files.append(csv_file)
+                            except queue.Full:
+                                with self.trigger.inflight_lock:
+                                    self.trigger.inflight_files.discard(csv_file)
+                                skipped_files.append({'file': csv_file, 'reason': 'queue full'})
+                        
+                        self.send_response(202)  # Accepted
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        response = {
+                            'status': 'accepted',
+                            'queued_files': queued_files,
+                            'skipped_files': skipped_files,
+                            'total_queued': len(queued_files),
+                            'total_skipped': len(skipped_files)
+                        }
+                        self.wfile.write(json.dumps(response).encode())
+                    
+                    except Exception as e:
+                        logger.error(f"Batch trigger error: {e}")
+                        self.send_response(500)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'error': str(e)}).encode())
+
+                elif self.path == '/resume/status':
+                    # Get resume status for a file
+                    try:
+                        content_length = int(self.headers.get('Content-Length', 0))
+                        post_data = self.rfile.read(content_length)
+                        data = json.loads(post_data.decode('utf-8'))
+                        
+                        csv_file = data.get('csv_file')
+                        if not csv_file:
+                            self.send_response(400)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': 'csv_file is required'}).encode())
+                            return
+                        
+                        file_hash = _calculate_file_hash(csv_file)
+                        resume_rows = _load_resume_rows(csv_file, file_hash, self.trigger.config) if file_hash else 0
+                        total_rows = _count_csv_rows(csv_file)
+                        
+                        response = {
+                            'csv_file': csv_file,
+                            'file_hash': file_hash,
+                            'resume_position': resume_rows,
+                            'total_rows': total_rows,
+                            'progress_percentage': (resume_rows / total_rows * 100) if total_rows > 0 else 0,
+                            'is_complete': resume_rows >= total_rows if total_rows > 0 else False
+                        }
+                        
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps(response).encode())
+                    
+                    except Exception as e:
+                        self.send_response(500)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'error': str(e)}).encode())
+                
+                elif self.path == '/resume/clear':
+                    # Clear resume marker for a file
+                    try:
+                        content_length = int(self.headers.get('Content-Length', 0))
+                        post_data = self.rfile.read(content_length)
+                        data = json.loads(post_data.decode('utf-8'))
+                        
+                        csv_file = data.get('csv_file')
+                        if not csv_file:
+                            self.send_response(400)
+                            self.send_header('Content-type', 'application/json')
+                            self.end_headers()
+                            self.wfile.write(json.dumps({'error': 'csv_file is required'}).encode())
+                            return
+                        
+                        file_hash = _calculate_file_hash(csv_file)
+                        if file_hash:
+                            _clear_resume_marker(csv_file, file_hash, self.trigger.config)
+                        
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            'status': 'success',
+                            'message': 'Resume marker cleared',
+                            'csv_file': csv_file
+                        }).encode())
+                    
+                    except Exception as e:
+                        self.send_response(500)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({'error': str(e)}).encode())
+                
+                else:
+                    self.send_response(404)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'error': 'Endpoint not found'}).encode())
+
+            def do_OPTIONS(self):
+                # Handle CORS preflight requests
+                self.send_response(200)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+                self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+                self.send_header('Access-Control-Max-Age', '3600')
+                self.end_headers()
+            
+            def end_headers(self):
+                # Add CORS headers to all responses
+                self.send_header('Access-Control-Allow-Origin', '*')
+                super().end_headers()
+
             def log_message(self, format, *args):
                 pass  # Suppress default logging
 
@@ -2577,8 +3774,7 @@ def create_health_check_server():
 
     except ImportError:
         logger.warning("HTTP server not available, health checks disabled")
-        return None
-
+        return None, None
 
 def keep_alive_with_watchdog(trigger: BulkAPITrigger, port: int = 8000):
     """Enhanced keep-alive with watchdog functionality"""
@@ -2910,6 +4106,11 @@ def load_environment_config():
             'window_size': int(os.getenv('WINDOW_SIZE', '20')),
             'error_threshold': float(os.getenv('ERROR_THRESHOLD', '0.3')),
             'max_workers': int(os.getenv('MAX_WORKERS', '3'))
+        },
+        'resume': {
+            'enabled': os.getenv('RESUME_ENABLED', 'true').lower() == 'true',
+            'checkpoint_interval': int(os.getenv('RESUME_CHECKPOINT_INTERVAL', '100')),
+            'marker_path': os.getenv('RESUME_MARKER_PATH', os.getenv('REPORT_PATH', '/app/data/reports'))
         },
         'retry': {
             'max_retries': max(0, min(int(os.getenv('MAX_RETRIES', '3') or '3'), 10)),
