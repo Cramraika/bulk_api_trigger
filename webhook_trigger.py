@@ -18,7 +18,7 @@ import shutil
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import heapq
-from threading import Lock, Semaphore, Event, Thread, Timer
+from threading import Lock, Semaphore, Event, Thread
 from tqdm import tqdm
 from typing import List, Dict, Optional, Tuple, Set
 from email.mime.text import MIMEText
@@ -47,9 +47,15 @@ def setup_logging():
     globals()['_logging_initialized'] = True
 
     # Avoid duplicate handlers if setup_logging() is ever called twice.
+    # Avoid duplicate handlers if setup_logging() is ever called twice.
     root_logger = logging.getLogger()
     if getattr(root_logger, "_already_configured", False):
         return logging.getLogger(__name__)
+    
+    # Also check for existing handlers of same type
+    for handler in root_logger.handlers:
+        if isinstance(handler, (RotatingFileHandler, logging.StreamHandler)):
+            return logging.getLogger(__name__)
 
     # Read level early
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -137,6 +143,35 @@ def _to_float(v, default=0.0):
 
 SENSITIVE_HEADER_KEYS = {"authorization", "x-api-key", "api-key", "proxy-authorization", "authentication"}
 
+def _deep_merge(dst: dict, src: dict) -> None:
+    """Deep merge src dict into dst dict"""
+    for k, v in (src or {}).items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_merge(dst[k], v)
+        else:
+            dst[k] = v
+
+def _calculate_file_hash(self, file_path: str) -> str:
+    hash_md5 = hashlib.md5()
+    try:
+        if not os.path.exists(file_path):
+            return ""
+        file_size = os.path.getsize(file_path)
+        if file_size == 0:
+            return hash_md5.hexdigest()  # Empty file hash
+        # Use adaptive chunk size with reasonable bounds
+        chunk_size = min(65536, max(4096, file_size // 100))
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    except (IOError, OSError) as e:
+        logger.error(f"Error calculating hash for {file_path}: {e}")
+        return ""
+    except Exception as e:
+        logger.error(f"Unexpected error calculating hash for {file_path}: {e}")
+        return ""
+
 def _redact_headers(h: Dict[str, str]) -> Dict[str, str]:
     redacted = {}
     for k, v in (h or {}).items():
@@ -146,9 +181,9 @@ def _redact_headers(h: Dict[str, str]) -> Dict[str, str]:
             redacted[k] = v
     return redacted
 
-def _resume_marker_path(self, file_path: str, file_hash: str) -> str:
+def _resume_marker_path(file_path: str, file_hash: str, config: Dict = None) -> str:
     base_dir = (
-        self.config.get('deployment', {}).get('report_path')
+        (config or {}).get('deployment', {}).get('report_path')
         or os.getenv('REPORT_PATH')
         or '/app/data/reports'
     )
@@ -156,9 +191,9 @@ def _resume_marker_path(self, file_path: str, file_hash: str) -> str:
     base = os.path.basename(file_path).replace('/', '_').replace('\\', '_')
     return os.path.join(base_dir, f".resume_{file_hash}_{base}.json")
 
-def _load_resume_rows(self, file_path: str, file_hash: str) -> int:
+def _load_resume_rows(file_path: str, file_hash: str, config: Dict = None) -> int:
     try:
-        p = self._resume_marker_path(file_path, file_hash)
+        p = _resume_marker_path(file_path, file_hash, config)
         if not os.path.exists(p):
             return 0
         with open(p, "r", encoding="utf-8") as f:
@@ -167,17 +202,17 @@ def _load_resume_rows(self, file_path: str, file_hash: str) -> int:
     except Exception:
         return 0
 
-def _save_resume_rows(self, file_path: str, file_hash: str, skip_rows: int) -> None:
+def _save_resume_rows(file_path: str, file_hash: str, skip_rows: int, config: Dict = None) -> None:
     try:
-        p = self._resume_marker_path(file_path, file_hash)
+        p = _resume_marker_path(file_path, file_hash, config)
         with open(p, "w", encoding="utf-8") as f:
             json.dump({"skip_rows": int(max(0, skip_rows))}, f)
     except Exception as e:
         logger.debug(f"Resume marker write failed for {file_path}: {e}")
 
-def _clear_resume_marker(self, file_path: str, file_hash: str) -> None:
+def _clear_resume_marker(file_path: str, file_hash: str, config: Dict = None) -> None:
     try:
-        p = self._resume_marker_path(file_path, file_hash)
+        p = _resume_marker_path(file_path, file_hash, config)
         if os.path.exists(p):
             os.remove(p)
     except Exception:
@@ -185,12 +220,14 @@ def _clear_resume_marker(self, file_path: str, file_hash: str) -> None:
 
 def prune_old_reports(report_dir: str, keep: int = 200):
     try:
-        if not os.path.exists(report_dir):
+        if not report_dir or not os.path.exists(report_dir):
             logger.debug(f"Report directory does not exist: {report_dir}")
             return
+        keep = max(1, keep)  # Keep at least 1 report
         files = sorted(
-            [os.path.join(report_dir, f) for f in os.listdir(report_dir) if f.startswith('job_') and f.endswith('.json')],
-            key=os.path.getmtime,
+            [os.path.join(report_dir, f) for f in os.listdir(report_dir) 
+             if f.startswith('job_') and f.endswith('.json')],
+            key=lambda x: os.path.getmtime(x) if os.path.exists(x) else 0,
             reverse=True
         )
         removed_count = 0
@@ -208,6 +245,8 @@ def prune_old_reports(report_dir: str, keep: int = 200):
 
 def _count_csv_rows(file_path: str) -> int:
     """Count non-header rows (with any value in webhook_url), respecting encoding/delimiter."""
+    if not file_path or not os.path.exists(file_path):
+        return 0
     try:
         enc = _detect_encoding(file_path)
         with open(file_path, 'r', encoding=enc, newline='') as f:
@@ -254,9 +293,19 @@ def _detect_encoding(csv_path: str) -> str:
 
 def _detect_delimiter(file_obj) -> str:
     """Detect CSV delimiter from file object"""
-    pos = file_obj.tell()
-    sample = file_obj.read(4096)
-    file_obj.seek(pos)
+    try:
+        pos = file_obj.tell()
+    except Exception:
+        pos = 0
+    try:
+        sample = file_obj.read(4096)
+        file_obj.seek(pos)
+    except Exception:
+        try:
+            file_obj.seek(pos)
+        except Exception:
+            pass
+        return ','  # Default to comma on any error
     try:
         dialect = csv.Sniffer().sniff(sample, delimiters=[',',';','\t','|'])
         return dialect.delimiter
@@ -304,8 +353,13 @@ _HTTP_LOCAL = threading.local()
 
 def get_http_session():
     """Get thread-local HTTP session"""
-    if not hasattr(_HTTP_LOCAL, 'session'):
-        _HTTP_LOCAL.session = _create_http_session()
+    if not hasattr(_HTTP_LOCAL, 'session') or _HTTP_LOCAL.session is None:
+        try:
+            _HTTP_LOCAL.session = _create_http_session()
+        except Exception as e:
+            logger.error(f"Failed to create HTTP session: {e}")
+            # Create a new session without pooling as fallback
+            _HTTP_LOCAL.session = requests.Session()
     return _HTTP_LOCAL.session
 
 # =========================
@@ -334,6 +388,7 @@ class DatabaseManager:
                 logger.error(f"Database connection error: {e}")
                 if conn:
                     try:
+                        conn.rollback()
                         conn.close()
                     except Exception:
                         pass
@@ -392,6 +447,7 @@ class DatabaseManager:
                     status TEXT DEFAULT 'running',
                     triggered_by TEXT DEFAULT 'manual',
                     average_response_time REAL,
+                    error_message TEXT,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -482,23 +538,22 @@ class DatabaseManager:
                 cursor.execute('''
                     SELECT AVG(response_time) 
                     FROM webhook_results 
-                    WHERE job_id = ? AND response_time IS NOT NULL
+                    WHERE job_id = ? AND response_time IS NOT NULL AND response_time > 0
                 ''', (job_id,))
                 result = cursor.fetchone()
-                avg_response_time = result[0] if result and result[0] is not None else 0
+                avg_response_time = float(result[0]) if result and result[0] is not None else 0.0
                 
                 # Calculate duration from start time
                 cursor.execute('SELECT start_time FROM job_history WHERE job_id = ?', (job_id,))
                 result = cursor.fetchone()
-                if result:
+                duration = 0
+                if result and result[0]:
                     try:
                         start_time = datetime.fromisoformat(result[0])
                         duration = max(0, (datetime.now() - start_time).total_seconds())
-                    except (ValueError, TypeError):
-                        logger.warning(f"Invalid start_time format for job {job_id}, using 0 duration")
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Invalid start_time format for job {job_id}: {e}, using 0 duration")
                         duration = 0
-                else:
-                    duration = 0
                     
                 # Update job record
                 cursor.execute('''
@@ -521,6 +576,19 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"Unexpected error finishing job {job_id}: {e}")
                 raise
+
+    def mark_job_failed(self, job_id: str, error_message: str):
+        """Mark a job as failed with error message"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE job_history 
+                SET status = 'failed', 
+                    end_time = ?,
+                    error_message = ?
+                WHERE job_id = ?
+            ''', (datetime.now().isoformat(), error_message, job_id))
+            conn.commit()
 
     def track_file(self, file_path: str, file_hash: str, file_size: int, rows_count: int = 0):
         with self.get_connection() as conn:
@@ -563,10 +631,13 @@ class DatabaseManager:
     def get_job_stats(self, job_id: str) -> Dict:
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            job = None
             status_stats = {}
-            cursor.execute('SELECT * FROM job_history WHERE job_id = ?', (job_id,))
-            job = cursor.fetchone()
+            try:
+                cursor.execute('SELECT * FROM job_history WHERE job_id = ?', (job_id,))
+                job = cursor.fetchone()
+            except Exception as e:
+                logger.error(f"Error fetching job {job_id}: {e}")
+                job = None
             cursor.execute('''
                 SELECT status, COUNT(*), AVG(response_time), MIN(response_time), MAX(response_time)
                 FROM webhook_results 
@@ -595,19 +666,23 @@ class DatabaseManager:
                     'average_response_time': 0.0,
                     'status_breakdown': status_stats,
                 }
-            duration = _to_float(job[8] if len(job) > 8 else 0, 0.0)
-            avg_response_time = _to_float(job[12] if len(job) > 12 else 0, 0.0)
+            # Safely access tuple elements with bounds checking
+            def safe_get(tup, idx, default=None):
+                return tup[idx] if tup and len(tup) > idx else default
+            
+            duration = _to_float(safe_get(job, 8, 0), 0.0)
+            avg_response_time = _to_float(safe_get(job, 12, 0), 0.0)
             return {
-                'job_id': job[0],
-                'job_name': job[1],
-                'csv_file': job[2],
-                'total_requests': int(_to_float(job[3], 0.0)),
-                'successful_requests': int(_to_float(job[4], 0.0)),
-                'failed_requests': int(_to_float(job[5], 0.0)),
-                'start_time': job[6],
-                'end_time': job[7],
+                'job_id': safe_get(job, 0, job_id),
+                'job_name': safe_get(job, 1, ''),
+                'csv_file': safe_get(job, 2, ''),
+                'total_requests': int(_to_float(safe_get(job, 3, 0), 0.0)),
+                'successful_requests': int(_to_float(safe_get(job, 4, 0), 0.0)),
+                'failed_requests': int(_to_float(safe_get(job, 5, 0), 0.0)),
+                'start_time': safe_get(job, 6, ''),
+                'end_time': safe_get(job, 7, ''),
                 'duration_seconds': duration,
-                'triggered_by': job[11] if len(job) > 11 else 'manual',
+                'triggered_by': safe_get(job, 11, 'manual'),
                 'average_response_time': avg_response_time,
                 'status_breakdown': status_stats
             }
@@ -625,9 +700,9 @@ class DatabaseManager:
 # =========================
 class NotificationManager:
     def __init__(self, config: Dict):
-        self.config = config
-        self.email_config = config.get('email', {})
-        self.slack_config = config.get('slack', {})
+        self.config = config or {}
+        self.email_config = config.get('email', {}) or {}
+        self.slack_config = config.get('slack', {}) or {}
 
     @staticmethod
     def send_startup_test_notifications(trigger: "BulkAPITrigger"):
@@ -670,8 +745,8 @@ class NotificationManager:
                 msg['To'] = ', '.join(to_emails)
                 msg['Subject'] = subject
                 msg.attach(MIMEText(body, 'html'))
-                smtp_port = int(self.email_config.get('smtp_port', 587))
-                smtp_server = self.email_config.get('smtp_server', 'smtp.gmail.com')
+                smtp_port = int(self.email_config.get('smtp_port', 587) or 587)
+                smtp_server = self.email_config.get('smtp_server', 'smtp.gmail.com') or 'smtp.gmail.com'
                 use_ssl = (smtp_port == 465)
                 if use_ssl:
                     server = smtplib.SMTP_SSL(smtp_server, smtp_port)
@@ -812,12 +887,14 @@ class RateLimiter:
 
     def tick(self):
         # Called per request completion to update throughput basis
-        self._completed += 1
+        with self._rate_lock:
+            self._completed += 1
 
     def sleep_if_needed(self):
         """Crude pacing to avoid too-aggressive bursts."""
         current_rate = self.get_rate()
         if current_rate <= 0:
+            time.sleep(0.1)  # Small delay if rate is invalid
             return
         target_interval = 1.0 / max(0.1, current_rate)  # seconds between starts
         now = time.time()
@@ -847,7 +924,8 @@ class EnhancedResultsTracker:
         # persist row
         try:
             if isinstance(result.get('headers_sent'), dict):
-                result['headers_sent'] = _redact_headers(result['headers_sent'])
+                result = dict(result)  # Create a copy to avoid modifying original
+                result['headers_sent'] = _redact_headers(result.get('headers_sent', {}))
             self.db.save_webhook_result(self.job_id, result)
         except Exception as e:
             logger.error(f"DB save failed: {e}")
@@ -859,12 +937,9 @@ class EnhancedResultsTracker:
             elapsed = max(0.001, time.time() - self._started_at)
             self._metrics['throughput'] = self._completed / elapsed
 
-    def save_results(self):
-        # no-op: results saved per record; keep method for API parity
-        pass
-
     def get_metrics(self) -> Dict:
-        return dict(self._metrics)
+        with self._lock:
+            return dict(self._metrics)
 
 
 # =========================
@@ -891,9 +966,11 @@ def read_csv_with_validation(csv_path: str, chunk_size: int = 1000, skip_rows: i
     try:
         with open(csv_path, 'r', encoding=enc, newline='') as f:
             delim = _detect_delimiter(f)
-            reader = csv.DictReader(f, delimiter=delim)
-
-            raw_headers = reader.fieldnames or []
+            try:
+                reader = csv.DictReader(f, delimiter=delim)
+                raw_headers = reader.fieldnames or []
+            except Exception as e:
+                raise ValueError(f"Failed to parse CSV headers in {csv_path}: {e}")
             headers = _normalize_headers(raw_headers)
 
             # validate required columns
@@ -911,7 +988,7 @@ def read_csv_with_validation(csv_path: str, chunk_size: int = 1000, skip_rows: i
                 if row_index < skip_rows:
                     continue
 
-                nrow = {name_map.get(k, k or ''): (v or '').strip() for k, v in row.items()}
+                nrow = {name_map.get(k, k if k else ''): (v if v else '').strip() for k, v in row.items()}
                 url = nrow.get('webhook_url', '').strip()
                 if not url:
                     stats['invalid_rows'] += 1
@@ -1071,11 +1148,16 @@ def _parse_retry_after_seconds(header_value: str, default: float) -> float:
     - If integer, treat as seconds.
     - If HTTP-date, compute delta from now.
     """
+    if not header_value:
+        return default
+    
     try:
         # integer seconds case
         secs = int(header_value.strip())
-        return float(secs)
-    except Exception:
+        if secs < 0:
+            return default
+        return float(min(MAX_BACKOFF_SECONDS, secs))
+    except (ValueError, AttributeError):
         pass
 
     # Try HTTP-date format
@@ -1122,7 +1204,7 @@ def make_request(
 
     attempt = int(attempt_start or 0)
     # Base backoff (from env), minimum 0.1s to avoid hot loops if user sets 0
-    base_backoff = max(0.1, float(retry_delay or 0.0))
+    base_backoff = max(0.1, float(retry_delay if retry_delay is not None else 1.0))
     backoff = backoff_override if backoff_override is not None else base_backoff
     error_code = 1  # assume failure until success
 
@@ -1132,9 +1214,9 @@ def make_request(
         if global_request_sema:
             try:
                 # Avoid indefinite blocking if the semaphore can't be acquired
-                acquire_timeout = max(1, int(os.getenv('SEMAPHORE_ACQUIRE_TIMEOUT', '30')))
-            except Exception:
-                acquire_timeout = 30
+                acquire_timeout = max(1.0, float(os.getenv('SEMAPHORE_ACQUIRE_TIMEOUT', '30')))
+            except (ValueError, TypeError):
+                acquire_timeout = 30.0
             try:
                 if not global_request_sema.acquire(timeout=acquire_timeout):
                     # Back off briefly and re-attempt this loop iteration
@@ -1161,8 +1243,13 @@ def make_request(
 
             if method_u in ('POST', 'PUT', 'PATCH'):
                 if isinstance(payload, (dict, list)):
-                    data = json.dumps(payload)
-                    req_size = len(data.encode('utf-8'))
+                    try:
+                        data = json.dumps(payload)
+                        req_size = len(data.encode('utf-8'))
+                    except (TypeError, ValueError) as e:
+                        logger.warning(f"Failed to serialize payload for {url}: {e}")
+                        data = str(payload)
+                        req_size = len(data.encode('utf-8'))
                     http_session = get_http_session()
                     resp = http_session.request(
                         method_u, url, data=data,
@@ -1272,9 +1359,8 @@ def make_request(
                 except Exception as e:
                     logger.warning(f"Semaphore release error: {e}")
 
-
-
-    return error_code
+    # If we exit the retry loop without returning, it means max retries exceeded
+    return error_code if isinstance(error_code, int) else 1
 
 
 # =========================
@@ -1293,8 +1379,14 @@ def move_file_reasoned(file_path: str, target_dir: str, reason_prefix: str = "")
         file_path = os.path.abspath(os.path.realpath(file_path))
         target_dir = os.path.abspath(os.path.realpath(target_dir))
 
-        if not target_dir or not os.path.exists(file_path) or not os.path.isfile(file_path):
-            logger.error(f"Invalid file or target: {file_path} -> {target_dir}")
+        if not target_dir:
+            logger.error(f"Invalid target directory: {target_dir}")
+            return False
+        if not os.path.exists(file_path):
+            logger.debug(f"File no longer exists: {file_path}")
+            return False
+        if not os.path.isfile(file_path):
+            logger.error(f"Path is not a file: {file_path}")
             return False
 
         allowed_prefixes = [os.path.abspath(p) for p in ['/app/data/', '/tmp/', os.getcwd()]]
@@ -1352,31 +1444,12 @@ class FileWatchdog(FileSystemEventHandler):
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT file_path FROM file_tracking WHERE status = "completed"')
-                self.processed_files = {row[0] for row in cursor.fetchall()}
+                rows = cursor.fetchall()
+                self.processed_files = {row[0] for row in rows if row and row[0]}
                 logger.info(f"Loaded {len(self.processed_files)} previously processed files")
         except Exception as e:
             logger.error(f"Error loading processed files: {e}")
-
-    def _calculate_file_hash(self, file_path: str) -> str:
-        hash_md5 = hashlib.md5()
-        try:
-            if not os.path.exists(file_path):
-                return ""
-            file_size = os.path.getsize(file_path)
-            if file_size == 0:
-                return hash_md5.hexdigest()  # Empty file hash
-            # Use adaptive chunk size with reasonable bounds
-            chunk_size = min(65536, max(4096, file_size // 100))
-            with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(chunk_size), b""):
-                    hash_md5.update(chunk)
-            return hash_md5.hexdigest()
-        except (IOError, OSError) as e:
-            logger.error(f"Error calculating hash for {file_path}: {e}")
-            return ""
-        except Exception as e:
-            logger.error(f"Unexpected error calculating hash for {file_path}: {e}")
-            return ""
+            self.processed_files = set()  # Initialize to empty set on error
 
     def _is_valid_csv_file(self, file_path: str) -> bool:
         try:
@@ -1385,7 +1458,7 @@ class FileWatchdog(FileSystemEventHandler):
 
                 # 1) Compute breadcrumbs first (before move)
                 try:
-                    fh = self._calculate_file_hash(file_path)
+                    fh = _calculate_file_hash(file_path)
                     fs = os.path.getsize(file_path) if os.path.exists(file_path) else 0
                     self.db_manager.track_file(file_path, fh or '', fs, rows_count=0)
                 except Exception as _e:
@@ -1410,7 +1483,7 @@ class FileWatchdog(FileSystemEventHandler):
 
                 return False
 
-            initial_size = os.path.getsize(file_path)
+            initial_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
             if initial_size == 0:
                 # Give the writer time to actually write data
                 debounce = float(self.config.get('watchdog', {}).get('debounce_delay', 3.0))
@@ -1436,7 +1509,7 @@ class FileWatchdog(FileSystemEventHandler):
                         logger.debug(f"Archive on empty-file failure skipped: {_e}")
                     # Record in DB for visibility (optional but useful)
                     try:
-                        fh = self._calculate_file_hash(file_path)
+                        fh = _calculate_file_hash(file_path)
                         fs = os.path.getsize(file_path) if os.path.exists(file_path) else 0
                         self.db_manager.track_file(file_path, fh or '', fs, rows_count=0)
                         self.db_manager.update_file_status(file_path, 'rejected_empty_file')
@@ -1472,7 +1545,7 @@ class FileWatchdog(FileSystemEventHandler):
                         logger.debug(f"Archive on validation failure skipped: {_e}")
                     # record rejection in DB for visibility
                     try:
-                        fh = self._calculate_file_hash(file_path)
+                        fh = _calculate_file_hash(file_path)
                         fs = os.path.getsize(file_path) if os.path.exists(file_path) else 0
                         self.db_manager.track_file(file_path, fh or '', fs, rows_count=0)
                         self.db_manager.update_file_status(file_path, 'rejected_missing_webhook_url')
@@ -1505,7 +1578,7 @@ class FileWatchdog(FileSystemEventHandler):
                         logger.debug(f"Archive on validation failure skipped: {_e}")
                     # record rejection in DB for visibility
                     try:
-                        fh = self._calculate_file_hash(file_path)
+                        fh = _calculate_file_hash(file_path)
                         fs = os.path.getsize(file_path) if os.path.exists(file_path) else 0
                         self.db_manager.track_file(file_path, fh or '', fs, rows_count=0)
                         self.db_manager.update_file_status(file_path, 'rejected_empty_webhook_url')
@@ -1549,22 +1622,21 @@ class FileWatchdog(FileSystemEventHandler):
                 if not os.path.exists(file_path):
                     logger.warning(f"File disappeared during processing: {file_path}")
                     return
-                file_hash = self._calculate_file_hash(file_path)
+                file_hash = _calculate_file_hash(file_path)
                 if not file_hash:
                     logger.warning(f"Could not calculate hash for {file_path}, skipping")
                     return
                 if self.db_manager.is_file_processed(file_path, file_hash):
-                    logger.info(f"⏭️  Duplicate content detected for {os.path.basename(file_path)} (hash match).")
-                    dup_dir = self.config.get('csv', {}).get('duplicates_path', '')
-                    moved = False
-                    if dup_dir:
-                        moved = move_file_reasoned(file_path, dup_dir, reason_prefix="dup_")
-                    else:
-                        logger.warning("No duplicates_path configured, cannot move duplicate file")
+                    logger.info(f"⭐️ Duplicate content detected for {os.path.basename(file_path)} (hash match).")
                     try:
                         self.db_manager.update_file_status(file_path, 'skipped_duplicate')
                     except Exception:
                         pass
+                    dup_dir = self.config.get('csv', {}).get('duplicates_path', '')
+                    if dup_dir:
+                        move_file_reasoned(file_path, dup_dir, reason_prefix="dup_")
+                    else:
+                        logger.warning("No duplicates_path configured, cannot move duplicate file")
                     return
                 
                 if self.db_manager.is_hash_processed(file_hash):
@@ -1602,11 +1674,21 @@ class FileWatchdog(FileSystemEventHandler):
                     logger.debug(f"Already {status} (DB): {file_path} — event {event_type} ignored")
                     return
                 # Immediately mark as queued to prevent race conditions
-                self.db_manager.update_file_status(file_path, 'queued')
+                # Check both DB and memory status atomically
                 with self.inflight_lock:
                     if file_path in self.inflight_files:
                         logger.debug(f"Already pending (in-memory): {file_path} — event {event_type} ignored")
                         return
+                    
+                    # Double-check DB status before marking as queued
+                    current_status = self.db_manager.get_file_status(file_path)
+                    if current_status in ('queued', 'processing'):
+                        logger.debug(f"Already {current_status} (DB): {file_path} — event {event_type} ignored")
+                        return
+                    
+                    # Atomically mark as queued and add to inflight
+                    self.db_manager.update_file_status(file_path, 'queued')
+                    self.inflight_files.add(file_path)
                 file_stats = os.stat(file_path)
                 file_size = file_stats.st_size
                 try:
@@ -1630,9 +1712,9 @@ class FileWatchdog(FileSystemEventHandler):
                     max_queue_size = self.config.get('watchdog', {}).get('max_queue_size', 100)
                     if self.job_queue.qsize() >= max_queue_size:
                         logger.warning(f"Queue full ({max_queue_size}), skipping file: {os.path.basename(file_path)}")
+                        self.db_manager.update_file_status(file_path, 'queue_full')
                         with self.inflight_lock:
                             self.inflight_files.discard(file_path)
-                        self.db_manager.update_file_status(file_path, 'queue_full')
                         return
                     self.job_queue.put_nowait(job_info)
                 except queue.Full:
@@ -1657,7 +1739,10 @@ def generate_job_id(prefix: str = "job") -> str:
 
 def archive_processed_file(file_path: str, config: Dict) -> bool:
     try:
-        csv_config = config.get('csv', {})
+        if not file_path or not os.path.exists(file_path):
+            logger.warning(f"Cannot archive non-existent file: {file_path}")
+            return False
+        csv_config = config.get('csv', {}) or {}
         if not csv_config.get('archive_processed', False):
             return False
         archive_path = csv_config.get('archive_path', '/app/data/csv/processed')
@@ -1679,37 +1764,32 @@ def archive_processed_file(file_path: str, config: Dict) -> bool:
 # =========================
 class BulkAPITrigger:
     def __init__(self, config: Dict):
-        self.config = config
+        self.config = config or {}
         self.inflight_lock = Lock()
         self.inflight_files: Set[str] = set()
-        gmax = int(os.getenv('GLOBAL_MAX_REQUESTS', '0') or '0')
+        try:
+            gmax = int(os.getenv('GLOBAL_MAX_REQUESTS', '0') or '0')
+        except (ValueError, TypeError):
+            gmax = 0
         self.global_request_sema = Semaphore(gmax) if gmax > 0 else None
-        self.db_manager = DatabaseManager(config.get('database', {}).get('path', '/app/data/webhook_results.db'))
+        db_path = (config.get('database', {}) or {}).get('path', '/app/data/webhook_results.db')
+        self.db_manager = DatabaseManager(db_path)
         self.notification_manager = NotificationManager(config.get('notifications', {}))
-        self.job_queue = queue.Queue(maxsize=config.get('watchdog', {}).get('max_queue_size', 100))
-        self.watchdog_enabled = config.get('watchdog', {}).get('enabled', False)
+        max_queue = (config.get('watchdog', {}) or {}).get('max_queue_size', 100)
+        self.job_queue = queue.Queue(maxsize=max_queue)
+        self.watchdog_enabled = (config.get('watchdog', {}) or {}).get('enabled', False)
         self.observer = None
         self.processing_threads: List[Thread] = []
         self.shutdown_event = Event()
+    
+    def _clear_resume_marker(self, file_path: str, file_hash: str) -> None:
+        """Clear resume marker for completed file processing"""
+        _clear_resume_marker(file_path, file_hash, self.config)
 
-    def _calculate_file_hash(self, file_path: str) -> str:
-        hash_md5 = hashlib.md5()
-        try:
-            if not os.path.exists(file_path):
-                return ""
-            # Use larger chunk size for better performance on large files
-            chunk_size = min(65536, max(4096, os.path.getsize(file_path) // 100))
-            with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(chunk_size), b""):
-                    hash_md5.update(chunk)
-            return hash_md5.hexdigest()
-        except (IOError, OSError) as e:
-            logger.error(f"Error calculating hash for {file_path}: {e}")
-            return ""
-        except Exception as e:
-            logger.error(f"Unexpected error calculating hash for {file_path}: {e}")
-            return ""
-        
+    def _load_resume_rows(self, file_path: str, file_hash: str) -> int:
+        """Load resume position for file processing"""
+        return _load_resume_rows(file_path, file_hash, self.config)
+    
     def trigger_webhooks(self, 
                         csv_files: List[str] = None, 
                         job_name: str = None,
@@ -1763,7 +1843,13 @@ class BulkAPITrigger:
             try:
                 # Only meaningful if we are processing a single concrete file path
                 if csv_file_path and isinstance(csv_file_path, str) and os.path.isfile(csv_file_path):
-                    resume_file_hash = self._calculate_file_hash(csv_file_path) or ""
+                    resume_file_hash = _calculate_file_hash(csv_file_path) or ""
+                    # Load existing resume position if available
+                    if resume_file_hash and skip_rows == 0:
+                        existing_skip = _load_resume_rows(csv_file_path, resume_file_hash, self.config)
+                        if existing_skip > 0:
+                            logger.info(f"🔄 Resuming from row {existing_skip} based on previous progress")
+                            skip_rows = existing_skip
             except Exception as _e:
                 logger.debug(f"Resume hash compute skipped: {_e}")
             if not all_webhooks:
@@ -1898,8 +1984,16 @@ class BulkAPITrigger:
                                     max_retries_cfg = int(self.config.get('retry', {}).get('max_retries', 3))
 
                                     if attempt_val < max_retries_cfg and not SHUTDOWN_EVENT.is_set():
-                                        _seq += 1
-                                        heapq.heappush(retry_heap, (time.time() + delay, _seq, webhook, attempt_val, next_backoff))
+                                        # Limit retry heap size to prevent memory issues
+                                        if len(retry_heap) < 10000:
+                                            _seq += 1
+                                            heapq.heappush(retry_heap, (time.time() + delay, _seq, webhook, attempt_val, next_backoff))
+                                        else:
+                                            logger.warning(f"Retry heap full, dropping retry for {webhook['url']}")
+                                            failed_count += 1
+                                            processed_count += 1
+                                            if pbar:
+                                                pbar.update(1)
                                     else:
                                         # exhausted retries — finalize as failure
                                         error_window.append(1)
@@ -1931,7 +2025,7 @@ class BulkAPITrigger:
                                 if resume_file_hash and (processed_count % 500 == 0):
                                     try:
                                         # 'skip_rows' is the caller-provided initial skip; add what we've finished now
-                                        self._save_resume_rows(csv_file_path, resume_file_hash, skip_rows + processed_count)
+                                        _save_resume_rows(csv_file_path, resume_file_hash, skip_rows + processed_count, self.config)
                                     except Exception as _e:
                                         logger.debug(f"Resume marker save skipped: {_e}")
 
@@ -1948,20 +2042,21 @@ class BulkAPITrigger:
                                 if resume_file_hash and (processed_count % 500 == 0):
                                     try:
                                         # skip_rows param indicates how many rows were intentionally skipped at start
-                                        self._save_resume_rows(csv_file_path, resume_file_hash, skip_rows + processed_count)
+                                        _save_resume_rows(csv_file_path, resume_file_hash, skip_rows + processed_count, self.config)
                                     except Exception as _e:
                                         logger.debug(f"Resume marker save skipped: {_e}")
                                 # --- percent-only throttled progress notification ---
-                                if progress_enabled and total_requests > 0:
-                                    pct_done = (processed_count / total_requests) * 100.0
+                                if progress_enabled and total_requests > 0 and processed_count > 0:
+                                    pct_done = (processed_count / max(1, total_requests)) * 100.0
 
                                     if pct_done >= min_pct:
                                         # decide the "bucket" to notify at (first at >= first_pct, then every step_pct)
                                         if pct_done < first_pct:
                                             bucket = -1.0
                                         else:
-                                            step_index = max(0, int((pct_done - first_pct) // max(1e-9, step_pct)))
-                                            bucket = first_pct + step_index * step_pct
+                                            safe_step_pct = max(0.1, step_pct)  # Prevent division by zero
+                                            step_index = max(0, int((pct_done - first_pct) // safe_step_pct))
+                                            bucket = first_pct + step_index * safe_step_pct
 
                                         # send once per bucket
                                         if bucket >= 0 and bucket > _last_notified_bucket:
@@ -2014,9 +2109,27 @@ class BulkAPITrigger:
                     except Exception:
                         pass
 
-            # Finalize job
-            self.db_manager.finish_job(job_id, successful_count, failed_count)
-            results_tracker.save_results()
+            # Finalize job with verification
+            try:
+                self.db_manager.finish_job(job_id, successful_count, failed_count)
+                
+                # Verify job was properly marked as completed
+                final_stats = self.db_manager.get_job_stats(job_id)
+                if final_stats.get('status') != 'completed':
+                    logger.warning(f"Job {job_id} status verification failed, current status: {final_stats.get('status')}")
+                    # Force status update
+                    with self.db_manager.get_connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute('UPDATE job_history SET status = ? WHERE job_id = ?', ('completed', job_id))
+                        conn.commit()
+                        logger.info(f"Forced job {job_id} status to completed")
+            except Exception as e:
+                logger.error(f"Error finalizing job {job_id}: {e}")
+                # Ensure job doesn't remain in running state
+                try:
+                    self.db_manager.mark_job_failed(job_id, f"Finalization error: {e}")
+                except Exception:
+                    pass
 
             # Archive processed (single-file mode, including CSV_FILE from env)
             try:
@@ -2096,7 +2209,7 @@ class BulkAPITrigger:
 
             try:
                 if resume_file_hash:
-                    self._clear_resume_marker(csv_file_path, resume_file_hash)
+                    _clear_resume_marker(csv_file_path, resume_file_hash)
             except Exception:
                 pass
 
@@ -2147,7 +2260,7 @@ class BulkAPITrigger:
                         logger.warning(f"File no longer exists: {job_info['csv_file']}")
                         self.db_manager.update_file_status(job_info['csv_file'], 'failed')
                         continue
-                    current_hash = self._calculate_file_hash(job_info['csv_file'])
+                    current_hash = _calculate_file_hash(job_info['csv_file'])
                     if current_hash and job_info.get('file_hash') and current_hash != job_info['file_hash']:
                         logger.info(f"File changed during debounce, re-queuing: {job_info['csv_file']}")
                         job_info['file_hash'] = current_hash
@@ -2173,13 +2286,23 @@ class BulkAPITrigger:
                         resume_skip = 0
                         try:
                             # prefer the hash we already have; else use the one we computed above; else compute now
-                            fh_for_resume = job_info.get('file_hash') or current_hash or self._calculate_file_hash(job_info['csv_file']) or ""
+                            fh_for_resume = job_info.get('file_hash') or current_hash or _calculate_file_hash(job_info['csv_file']) or ""
                             if fh_for_resume:
-                                resume_skip = int(self._load_resume_rows(job_info['csv_file'], fh_for_resume) or 0)
+                                resume_skip = int(_load_resume_rows(job_info['csv_file'], fh_for_resume) or 0)
                                 if resume_skip > 0:
                                     logger.info(f"⏯️  Resuming {os.path.basename(job_info['csv_file'])} from row {resume_skip}")
+                                    # Validate resume point doesn't exceed file size
+                                    try:
+                                        total_rows = _count_csv_rows(job_info['csv_file'])
+                                        if total_rows > 0 and resume_skip >= total_rows:
+                                            logger.warning(f"Resume point {resume_skip} exceeds file size {total_rows}, starting from beginning")
+                                            resume_skip = 0
+                                            _clear_resume_marker(job_info['csv_file'], fh_for_resume)
+                                    except Exception as row_count_e:
+                                        logger.warning(f"Could not validate resume point: {row_count_e}, proceeding with resume_skip={resume_skip}")
                         except Exception as _e:
-                            logger.debug(f"Resume check failed: {_e}")
+                            logger.warning(f"Resume check failed: {_e}, starting from beginning")
+                            resume_skip = 0
 
                         job_id = self.trigger_webhooks(
                             csv_files=[job_info['csv_file']],
@@ -2212,10 +2335,11 @@ class BulkAPITrigger:
     def stop_watchdog(self):
         """Stop the watchdog system gracefully"""
         logger.info("🛑 Stopping watchdog system...")
-        self.shutdown_event.set()
+        if hasattr(self, 'shutdown_event'):
+            self.shutdown_event.set()
         
         # Stop observer first
-        if self.observer:
+        if hasattr(self, 'observer') and self.observer:
             try:
                 self.observer.stop()
                 self.observer.join(timeout=5)
@@ -2236,17 +2360,16 @@ class BulkAPITrigger:
 
     def get_system_status(self) -> Dict:
         """Get comprehensive system status"""
+        queue_size = -1  # Default to unknown
         try:
-            if hasattr(self.job_queue, 'qsize'):
+            if self.job_queue and hasattr(self.job_queue, 'qsize'):
                 queue_size = self.job_queue.qsize()
-            else:
-                queue_size = 0
+            elif self.job_queue:
+                queue_size = 0  # Queue exists but no qsize method
         except (AttributeError, OSError) as e:
             logger.debug(f"Cannot get queue size: {e}")
-            queue_size = -1  # Indicate unknown
         except Exception as e:
             logger.error(f"Unexpected error getting queue size: {e}")
-            queue_size = -1
         processing_threads_running = bool(self.processing_threads) and any(t.is_alive() for t in self.processing_threads)
         return {
             'watchdog_enabled': self.watchdog_enabled,
@@ -2262,8 +2385,10 @@ class BulkAPITrigger:
             with self.db_manager.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT 1')
-                return True
-        except Exception:
+                result = cursor.fetchone()
+                return result is not None and result[0] == 1
+        except Exception as e:
+            logger.debug(f"Database health check failed: {e}")
             return False
 
 
@@ -2277,8 +2402,9 @@ def create_health_check_server():
         import json
 
         class HealthCheckHandler(BaseHTTPRequestHandler):
-            def __init__(self, trigger_instance, *args, **kwargs):
-                self.trigger = trigger_instance
+            trigger = None
+            
+            def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
 
             def do_GET(self):
@@ -2313,8 +2439,9 @@ def create_health_check_server():
                                 cur = conn.cursor()
                                 cur.execute("""
                                     SELECT job_id, job_name, total_requests, successful_requests, failed_requests,
-                                           start_time, end_time, duration_seconds, status
+                                        start_time, end_time, duration_seconds, status
                                     FROM job_history
+                                    WHERE status IN ('completed', 'failed', 'running')
                                     ORDER BY start_time DESC
                                     LIMIT 50
                                 """)
@@ -2435,11 +2562,19 @@ def create_health_check_server():
                 pass  # Suppress default logging
 
         def start_server(trigger_instance, port=8000):
-            handler = lambda *args, **kwargs: HealthCheckHandler(trigger_instance, *args, **kwargs)
-            server = HTTPServer(('0.0.0.0', port), handler)
+            HealthCheckHandler.trigger = trigger_instance
+            server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
             server.serve_forever()
 
-        return start_server
+        def stop_server(server):
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception as e:
+                logger.error(f"Error stopping health server: {e}")
+        
+        return start_server, stop_server
+
     except ImportError:
         logger.warning("HTTP server not available, health checks disabled")
         return None
@@ -2448,8 +2583,9 @@ def create_health_check_server():
 def keep_alive_with_watchdog(trigger: BulkAPITrigger, port: int = 8000):
     """Enhanced keep-alive with watchdog functionality"""
     logger.info("🔄 Webhook processing completed. Starting keep-alive with watchdog...")
-    health_server_starter = create_health_check_server()
-    if health_server_starter and trigger.config.get('deployment', {}).get('health_check_enabled', True):
+    health_server_funcs = create_health_check_server()
+    if health_server_funcs and trigger.config.get('deployment', {}).get('health_check_enabled', True):
+        health_server_starter = health_server_funcs[0] if isinstance(health_server_funcs, tuple) else health_server_funcs
         health_thread = Thread(target=health_server_starter, args=(trigger, port), daemon=True)
         health_thread.start()
         logger.info(f"🏥 Health check server started on port {port}")
@@ -2491,6 +2627,12 @@ def keep_alive_with_watchdog(trigger: BulkAPITrigger, port: int = 8000):
 def backup_database(db_manager: DatabaseManager):
     """Create database backup"""
     try:
+        if not db_manager or not hasattr(db_manager, 'db_path'):
+            logger.error("Invalid DatabaseManager for backup")
+            return
+        if not os.path.exists(db_manager.db_path):
+            logger.error(f"Database file not found: {db_manager.db_path}")
+            return
         backup_dir = '/app/data/backups'
         os.makedirs(backup_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2606,13 +2748,18 @@ def write_job_json_report(
     
     try:
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
+            json.dump(report, f, indent=2, ensure_ascii=False, default=str)
     except Exception as e:
+        logger.warning(f"Failed to write report to {out_path}: {e}")
         # fallback: write to /app/data with a timestamped name
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join("/app/data", f"job_{safe_job_id}_{ts}.json")
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = os.path.join("/app/data", f"job_{safe_job_id}_{ts}.json")
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, ensure_ascii=False, default=str)
+        except Exception as e2:
+            logger.error(f"Failed to write report even to fallback path: {e2}")
+            raise
     
     return out_path
 
@@ -2628,14 +2775,19 @@ def scan_existing_files(trigger: BulkAPITrigger):
 
         # 1) Handle NON-CSV first: breadcrumb → move → status
         try:
-            for path in glob.glob(os.path.join(watch_path, '*')):
+            try:
+                paths = glob.glob(os.path.join(watch_path, '*'))
+            except Exception as e:
+                logger.error(f"Failed to scan directory {watch_path}: {e}")
+                continue
+            for path in paths:
                 if not os.path.isfile(path):
                     continue
                 if path.lower().endswith('.csv'):
                     continue  # handled next
                 try:
                     # breadcrumb (hash/size) before any move
-                    file_hash = trigger._calculate_file_hash(path)
+                    file_hash = _calculate_file_hash(path)
                     file_size = os.path.getsize(path) if os.path.exists(path) else 0
                     trigger.db_manager.track_file(path, file_hash or '', file_size, rows_count=0)
                 except Exception as _e:
@@ -2665,7 +2817,7 @@ def scan_existing_files(trigger: BulkAPITrigger):
             csv_files = glob.glob(os.path.join(watch_path, '*.csv'))
             for csv_file in csv_files:
                 try:
-                    file_hash = trigger._calculate_file_hash(csv_file)
+                    file_hash = _calculate_file_hash(csv_file)
                     if not file_hash:
                         continue
                     if trigger.db_manager.is_hash_processed(file_hash):
@@ -2726,9 +2878,11 @@ class ConfigManager:
 
     @staticmethod
     def load_config_file(path: str) -> Dict:
+        if not path:
+            raise ValueError("Config path cannot be empty")
         if not os.path.exists(path):
-            raise FileNotFoundError(path)
-        with open(path, 'r') as f:
+            raise FileNotFoundError(f"Config file not found: {path}")
+        with open(path, 'r', encoding='utf-8') as f:
             text = f.read()
         try:
             if path.endswith(('.yaml', '.yml')):
@@ -2758,9 +2912,9 @@ def load_environment_config():
             'max_workers': int(os.getenv('MAX_WORKERS', '3'))
         },
         'retry': {
-            'max_retries': max(0, min(int(os.getenv('MAX_RETRIES', '3')), 10)),
-            'timeout': max(1, min(int(os.getenv('REQUEST_TIMEOUT', '30')), 300)),
-            'retry_delay': max(0.1, min(float(os.getenv('RETRY_DELAY', '1.0')), 60.0)),
+            'max_retries': max(0, min(int(os.getenv('MAX_RETRIES', '3') or '3'), 10)),
+            'timeout': max(1, min(int(os.getenv('REQUEST_TIMEOUT', '30') or '30'), 300)),
+            'retry_delay': max(0.1, min(float(os.getenv('RETRY_DELAY', '1.0') or '1.0'), 60.0)),
         },
         'deployment': {
             'keep_alive': os.getenv('KEEP_ALIVE', 'true').lower() == 'true',
@@ -2778,7 +2932,7 @@ def load_environment_config():
                 'username': os.getenv('EMAIL_USERNAME', ''),
                 'password': os.getenv('EMAIL_PASSWORD', ''),
                 'from_email': os.getenv('EMAIL_FROM', ''),
-                'recipients': os.getenv('EMAIL_RECIPIENTS', '').split(',') if os.getenv('EMAIL_RECIPIENTS') else [],
+                'recipients': [e.strip() for e in os.getenv('EMAIL_RECIPIENTS', '').split(',') if e.strip()] if os.getenv('EMAIL_RECIPIENTS') else [],
                 'notify_on_completion': os.getenv('EMAIL_NOTIFY_COMPLETION', 'true').lower() == 'true',
                 'notify_on_file_detected': os.getenv('EMAIL_NOTIFY_FILE_DETECTED', 'false').lower() == 'true'
             },
@@ -2813,8 +2967,8 @@ def validate_config(config: Dict) -> Dict:
     validated = dict(config)
     
     # Ensure numeric values are within reasonable bounds
-    rate_limit = validated.get('rate_limiting', {})
-    rate_limit['max_workers'] = max(1, min(int(rate_limit.get('max_workers', 3)), 50))
+    rate_limit = validated.get('rate_limiting', {}) or {}
+    rate_limit['max_workers'] = max(1, min(int(rate_limit.get('max_workers', 3) or 3), 50))
     rate_limit['base_rate_limit'] = max(0.1, min(float(rate_limit.get('base_rate_limit', 3.0)), 100.0))
     rate_limit['max_rate_limit'] = max(rate_limit.get('base_rate_limit', 3.0), 
                                       min(float(rate_limit.get('max_rate_limit', 5.0)), 100.0))
@@ -2862,11 +3016,16 @@ def validate_config(config: Dict) -> Dict:
 def main():
     """Enhanced main function with watchdog and comprehensive error handling"""
     import signal
+    global trigger_instance
     trigger_instance = None
     def signal_handler(signum, frame):
+        global trigger_instance
         logger.info(f"🛑 Received signal {signum}, shutting down gracefully...")
         if trigger_instance:
-            trigger_instance.stop_watchdog()
+            try:
+                trigger_instance.stop_watchdog()
+            except Exception as e:
+                logger.error(f"Error during shutdown: {e}")
         sys.exit(0)
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -2922,14 +3081,6 @@ def main():
         for config_file in ['config.yaml', 'config.yml', 'config.json']:
             if os.path.exists(config_file):
                 file_config = ConfigManager.load_config_file(config_file)
-
-                # Merge helper: dst <- src (src overwrites dst)
-                def _deep_merge(dst, src):
-                    for k, v in (src or {}).items():
-                        if isinstance(v, dict) and isinstance(dst.get(k), dict):
-                            _deep_merge(dst[k], v)
-                        else:
-                            dst[k] = v
 
                 # Start from file as defaults, then apply ENV on top so ENV wins
                 merged = dict(file_config or {})
