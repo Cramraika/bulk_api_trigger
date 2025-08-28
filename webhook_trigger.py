@@ -1011,15 +1011,34 @@ class NotificationManager:
     def send_file_detected_notification(self, file_info: Dict):
         if not self.slack_config.get('enabled') or not self.slack_config.get('notify_on_file_detected', True):
             return
-        message = (
-            f"*New CSV File Detected*\n\n"
-            f"*File:* {os.path.basename(file_info['csv_file'])}\n"
-            f"*Size:* {file_info['file_size']} bytes\n"
-            f"*Rows:* {file_info['row_count']} webhooks\n"
-            f"*Event:* {file_info['event_type']}\n"
-            f"*Time:* {file_info['detected_at']}\n\n"
-            f"Processing will start shortly..."
-        )
+        
+        # Check if this is a resume case
+        resume_position = file_info.get('resume_position', 0)
+        total_rows = file_info.get('row_count', 0)
+        
+        if resume_position > 0:
+            remaining_rows = max(0, total_rows - resume_position)
+            message = (
+                f"*CSV File Resume Detected*\n\n"
+                f"*File:* {os.path.basename(file_info['csv_file'])}\n"
+                f"*Size:* {file_info['file_size']} bytes\n"
+                f"*Total Rows:* {total_rows} webhooks\n"
+                f"*Resume Position:* {resume_position}\n"
+                f"*Remaining:* {remaining_rows} webhooks\n"
+                f"*Event:* {file_info['event_type']}\n"
+                f"*Time:* {file_info['detected_at']}\n\n"
+                f"Processing will resume shortly..."
+            )
+        else:
+            message = (
+                f"*New CSV File Detected*\n\n"
+                f"*File:* {os.path.basename(file_info['csv_file'])}\n"
+                f"*Size:* {file_info['file_size']} bytes\n"
+                f"*Rows:* {total_rows} webhooks\n"
+                f"*Event:* {file_info['event_type']}\n"
+                f"*Time:* {file_info['detected_at']}\n\n"
+                f"Processing will start shortly..."
+            )
         self.send_slack_notification(message, 'low')
 
 
@@ -2021,9 +2040,12 @@ class BulkAPITrigger:
             total_requests = len(all_webhooks)
             logger.info(f"Loaded {total_requests} webhook requests")
             
-            # Initialize job in database
-            self.db_manager.start_job(job_id, job_name, csv_file_path, total_requests, self.config, triggered_by)
-            
+            # Initialize job in database with correct totals for resume cases
+            effective_total = len(all_webhooks)  # This reflects actual work to be done
+            self.db_manager.start_job(job_id, job_name, csv_file_path, effective_total, self.config, triggered_by)
+            # Update local total_requests to match what we're actually processing
+            total_requests = effective_total
+
             # Setup rate limiting and tracking
             rate_config = self.config.get('rate_limiting', {})
             rate_limiter = RateLimiter(
@@ -2054,9 +2076,10 @@ class BulkAPITrigger:
             with ThreadPoolExecutor(max_workers=rate_config.get('max_workers', 3)) as executor:
                 pbar = None
                 try:
+                    resume_desc = f"API Requests (Resumed from {skip_rows})" if skip_rows > 0 else "API Requests"
                     pbar = tqdm(
                         total=total_requests,
-                        desc="API Requests",
+                        desc=resume_desc,
                         dynamic_ncols=False,
                         ascii=True,
                         file=sys.stdout,
@@ -2219,12 +2242,23 @@ class BulkAPITrigger:
                                             if urgency == "auto":
                                                 urgency = _slack_urgency_for_progress(successful_count, processed_count)
 
-                                            msg = (
-                                                f"*{job_name}* in progress\n"
-                                                f"{processed_count}/{total_requests} processed\n"
-                                                f"{successful_count} success | {failed_count} failed\n"
-                                                f"~{pct_done:.1f}% done"
-                                            )
+                                            # Show context for resume vs fresh start
+                                            if skip_rows > 0:
+                                                actual_file_position = skip_rows + processed_count
+                                                msg = (
+                                                    f"*{job_name}* in progress (Resume)\n"
+                                                    f"File Position: {actual_file_position} (Skip: {skip_rows} + Processed: {processed_count})\n"
+                                                    f"Current Batch: {processed_count}/{total_requests}\n"
+                                                    f"{successful_count} success | {failed_count} failed\n"
+                                                    f"~{pct_done:.1f}% of remaining done"
+                                                )
+                                            else:
+                                                msg = (
+                                                    f"*{job_name}* in progress\n"
+                                                    f"{processed_count}/{total_requests} processed\n"
+                                                    f"{successful_count} success | {failed_count} failed\n"
+                                                    f"~{pct_done:.1f}% done"
+                                                )
                                             try:
                                                 self.notification_manager.send_slack_notification(msg, urgency)
                                                 _last_notified_bucket = bucket
@@ -2437,6 +2471,18 @@ Data Processed: {metrics['total_request_size'] + metrics['total_response_size']}
                             job_info['row_count'] = _count_csv_rows(job_info['csv_file'])
                         except Exception:
                             pass
+
+                    # Add resume context for notifications
+                    fh_for_resume = job_info.get('file_hash') or current_hash or _calculate_file_hash(job_info['csv_file']) or ""
+                    if fh_for_resume:
+                        try:
+                            resume_skip = int(_load_resume_rows(job_info['csv_file'], fh_for_resume) or 0)
+                            job_info['resume_position'] = resume_skip
+                        except Exception:
+                            job_info['resume_position'] = 0
+                    else:
+                        job_info['resume_position'] = 0
+
                     self.notification_manager.send_file_detected_notification(job_info)
                     job_name = f"{os.path.basename(job_info['csv_file'])}"
                     logger.info(f"Auto-processing file: {os.path.basename(job_info['csv_file'])}")
