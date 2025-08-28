@@ -878,7 +878,7 @@ class NotificationManager:
                 return
             nm = trigger.notification_manager
             if nm.slack_config.get('enabled'):
-                nm.send_slack_notification("Test Slack from Bulk API Trigger (startup)", "low")
+                nm.send_slack_notification("✅ Test Slack from Bulk API Trigger (startup)", "low")
             if nm.email_config.get('enabled') and nm.email_config.get('recipients'):
                 nm.send_email_notification(
                     subject="Test Email from Bulk API Trigger (startup)",
@@ -975,15 +975,16 @@ class NotificationManager:
         success_rate = (succ / total * 100.0) if total else 0.0
         urgency = 'normal' if success_rate >= 95 else ('high' if success_rate >= 80 else 'critical')
         if self.slack_config.get('enabled') and self.slack_config.get('notify_on_completion', True):
+            completion_emoji = "🎉" if success_rate >= 95 else ("⚠️" if success_rate >= 80 else "🚨")
             slack_message = (
-                f"*Bulk API Job Completed*\n\n"
-                f"*Job:* {job_stats.get('job_name','')}\n"
-                f"*File:* {os.path.basename(job_stats.get('csv_file','Multiple files'))}\n"
-                f"*Triggered:* {job_stats.get('triggered_by','manual')}\n"
-                f"*Success Rate:* {success_rate:.2f}%\n"
-                f"*Requests:* {succ}/{total} successful\n"
-                f"*Duration:* {_to_float(job_stats.get('duration_seconds')):.2f}s\n"
-                f"*Avg Response:* {_to_float(job_stats.get('average_response_time')):.3f}s"
+                f"{completion_emoji} *Bulk API Job Completed*\n\n"
+                f"🏷️ *Job:* {job_stats.get('job_name','')}\n"
+                f"📁 *File:* {os.path.basename(job_stats.get('csv_file','Multiple files'))}\n"
+                f"🎯 *Triggered:* {job_stats.get('triggered_by','manual')}\n"
+                f"📊 *Success Rate:* {success_rate:.2f}%\n"
+                f"📈 *Requests:* {succ}/{total} successful\n"
+                f"⏱️ *Duration:* {_to_float(job_stats.get('duration_seconds')):.2f}s\n"
+                f"⚡ *Avg Response:* {_to_float(job_stats.get('average_response_time')):.3f}s"
             )
             self.send_slack_notification(slack_message, urgency)
         if self.email_config.get('enabled') and self.email_config.get('notify_on_completion', True):
@@ -1019,25 +1020,25 @@ class NotificationManager:
         if resume_position > 0:
             remaining_rows = max(0, total_rows - resume_position)
             message = (
-                f"*CSV File Resume Detected*\n\n"
-                f"*File:* {os.path.basename(file_info['csv_file'])}\n"
-                f"*Size:* {file_info['file_size']} bytes\n"
-                f"*Total Rows:* {total_rows} webhooks\n"
-                f"*Resume Position:* {resume_position}\n"
-                f"*Remaining:* {remaining_rows} webhooks\n"
-                f"*Event:* {file_info['event_type']}\n"
-                f"*Time:* {file_info['detected_at']}\n\n"
-                f"Processing will resume shortly..."
+                f"🔄 *CSV File Resume Detected*\n\n"
+                f"📁 *File:* {os.path.basename(file_info['csv_file'])}\n"
+                f"📊 *Size:* {file_info['file_size']} bytes\n"
+                f"📋 *Total Rows:* {total_rows} webhooks\n"
+                f"⏭️ *Resume Position:* {resume_position}\n"
+                f"🎯 *Remaining:* {remaining_rows} webhooks\n"
+                f"🔍 *Event:* {file_info['event_type']}\n"
+                f"🕐 *Time:* {file_info['detected_at']}\n\n"
+                f"🚀 Processing will resume shortly..."
             )
         else:
             message = (
-                f"*New CSV File Detected*\n\n"
-                f"*File:* {os.path.basename(file_info['csv_file'])}\n"
-                f"*Size:* {file_info['file_size']} bytes\n"
-                f"*Rows:* {total_rows} webhooks\n"
-                f"*Event:* {file_info['event_type']}\n"
-                f"*Time:* {file_info['detected_at']}\n\n"
-                f"Processing will start shortly..."
+                f"📄 *New CSV File Detected*\n\n"
+                f"📁 *File:* {os.path.basename(file_info['csv_file'])}\n"
+                f"📊 *Size:* {file_info['file_size']} bytes\n"
+                f"📋 *Rows:* {total_rows} webhooks\n"
+                f"🔍 *Event:* {file_info['event_type']}\n"
+                f"🕐 *Time:* {file_info['detected_at']}\n\n"
+                f"🚀 Processing will start shortly..."
             )
         self.send_slack_notification(message, 'low')
 
@@ -1956,7 +1957,7 @@ class BulkAPITrigger:
         if not job_name:
             job_name = f"Bulk API Job {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         job_logger = logging.LoggerAdapter(logger, {"job_id": job_id, "job_name": job_name})
-        job_logger.info("Starting job")
+        job_logger.info("🚀 Starting job")
         try:
             # Load webhooks - explicit arg > .env CSV_FILE > AUTO patterns
             env_csv = os.getenv("CSV_FILE", "AUTO").strip()
@@ -2246,18 +2247,18 @@ class BulkAPITrigger:
                                             if skip_rows > 0:
                                                 actual_file_position = skip_rows + processed_count
                                                 msg = (
-                                                    f"*{job_name}* in progress (Resume)\n"
-                                                    f"File Position: {actual_file_position} (Skip: {skip_rows} + Processed: {processed_count})\n"
-                                                    f"Current Batch: {processed_count}/{total_requests}\n"
-                                                    f"{successful_count} success | {failed_count} failed\n"
-                                                    f"~{pct_done:.1f}% of remaining done"
+                                                    f"🔄 *{job_name}* in progress (Resume)\n"
+                                                    f"📍 File Position: {actual_file_position} (Skip: {skip_rows} + Processed: {processed_count})\n"
+                                                    f"⚡ Current Batch: {processed_count}/{total_requests}\n"
+                                                    f"✅ {successful_count} success | ❌ {failed_count} failed\n"
+                                                    f"📊 ~{pct_done:.1f}% of remaining done"
                                                 )
                                             else:
                                                 msg = (
-                                                    f"*{job_name}* in progress\n"
-                                                    f"{processed_count}/{total_requests} processed\n"
-                                                    f"{successful_count} success | {failed_count} failed\n"
-                                                    f"~{pct_done:.1f}% done"
+                                                    f"⏳ *{job_name}* in progress\n"
+                                                    f"⚡ {processed_count}/{total_requests} processed\n"
+                                                    f"✅ {successful_count} success | ❌ {failed_count} failed\n"
+                                                    f"📊 ~{pct_done:.1f}% done"
                                                 )
                                             try:
                                                 self.notification_manager.send_slack_notification(msg, urgency)
