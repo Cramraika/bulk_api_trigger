@@ -32,3 +32,6 @@ Thumbs.db
 .env.*
 !.env.example
 !.env.template
+
+# VS Code
+.vscode/
