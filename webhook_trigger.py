@@ -78,8 +78,7 @@ def setup_logging():
     from logging.handlers import RotatingFileHandler
     
     # Global module-level guard to prevent any possibility of duplicate setup
-    global _logging_initialized
-    if '_logging_initialized' in globals() and _logging_initialized:
+    if globals().get('_logging_initialized'):
         return logging.getLogger(__name__)
     
     globals()['_logging_initialized'] = True
@@ -3355,7 +3354,7 @@ def write_job_json_report(
     """
     try:
         os.makedirs(out_dir, exist_ok=True)
-    except Exception as e:
+    except Exception:
         try:
             # fallback: put it under /app/data if reports fails
             out_dir = "/app/data"
@@ -3712,7 +3711,6 @@ def main():
     global trigger_instance
     trigger_instance = None
     def signal_handler(signum, frame):
-        global trigger_instance
         try:
             logger.info(f"Received signal {signum}, shutting down gracefully...")
             if trigger_instance:
