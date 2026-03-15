@@ -99,7 +99,12 @@ def setup_logging():
 
     # Ensure directories exist and are writable
     log_dir = '/app/data/logs'
-    os.makedirs(log_dir, exist_ok=True)
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError:
+        # Fallback for local development (non-Docker)
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'logs')
+        os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, 'webhook_trigger.log')
 
     # Formatter: include thread and time
