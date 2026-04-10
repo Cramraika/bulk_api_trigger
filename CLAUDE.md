@@ -35,6 +35,15 @@ curl http://localhost:8000/status
 - `SLACK_WEBHOOK_URL` - Slack notification webhook
 - `DATABASE_PATH` - SQLite database path (default: `/app/data/webhook_results.db`)
 
+## n8n Workflow Automation
+
+This project can trigger and receive n8n workflows at `https://n8n.chinmayramraika.in`.
+
+- **Webhook URL:** Set in `N8N_WEBHOOK_URL` env var
+- **API Key:** Set in `N8N_API_KEY` env var (unique per project)
+- **Auth Header:** `X-API-Key: <N8N_API_KEY>`
+- **Workflow repo:** github.com/Cramraika/n8n-workflows (private)
+
 ## Security Rules
 - NEVER hardcode API keys, secrets, or credentials in any file
 - NEVER pass credentials as inline env vars in Bash commands
