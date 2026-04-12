@@ -8,6 +8,22 @@ import time
 import argparse
 import sys
 import os
+
+# Sentry/GlitchTip error tracking — initialise at module import time so any
+# uncaught exception anywhere in the long-running worker is reported.
+# DSN is supplied via env var SENTRY_DSN (empty value disables the SDK).
+try:
+    import sentry_sdk as _sentry_sdk
+    _sentry_dsn = os.environ.get("SENTRY_DSN", "").strip()
+    if _sentry_dsn:
+        _sentry_sdk.init(
+            dsn=_sentry_dsn,
+            traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+            environment=os.environ.get("DEPLOY_ENV", "production"),
+            release=os.environ.get("APP_RELEASE"),
+        )
+except ImportError:  # pragma: no cover - optional dependency
+    pass
 import random
 import glob
 import logging

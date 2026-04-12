@@ -7,3 +7,4 @@ urllib3>=2.6.3
 certifi>=2023.0.0
 charset-normalizer>=3.0.0
 idna>=3.4
+sentry-sdk>=2.18.0
