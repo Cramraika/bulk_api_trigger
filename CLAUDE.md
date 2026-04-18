@@ -1,5 +1,78 @@
 # Bulk API Trigger
 
+## Claude Preamble (preloaded universal rules)
+<!-- VERSION: 2026-04-18-v3 -->
+<!-- SYNC-SOURCE: ~/.claude/conventions/universal-claudemd.md -->
+
+### Laws
+- Never hardcode secrets. Use env vars + `.env.example`.
+- Don't commit unless asked. Passing tests ≠ permission to commit.
+- Never skip hooks (`--no-verify`) unless user asks. Fix root cause.
+- Never force-push to main. Prefer NEW commits over amending.
+- Stage files by name, not `git add -A`. Avoids .env/credential leaks.
+- Conventional Commits (`feat:` / `fix:` / `docs:` / `refactor:` / `test:` / `chore:`). Subject ≤72 chars.
+- Integration tests hit real systems (DB, APIs); mocks at unit level only.
+- Never delete a failing test to make the build pass.
+- Three similar lines > premature abstraction.
+- Comments explain non-obvious WHY, never WHAT.
+- Destructive ops (`rm -rf`, `git reset --hard`, force-push, drop table) → ask first.
+- Visible actions (PRs, Slack, Stripe, Gmail) → confirm unless pre-authorized.
+
+### Doc & scratch placement
+- Plans: `docs/plans/YYYY-MM-DD-<slug>.md`
+- Specs: `docs/specs/YYYY-MM-DD-<slug>.md`
+- Architecture: `docs/architecture/`
+- Runbooks: `docs/runbooks/`
+- ADRs: `docs/adrs/ADR-NNN-<slug>.md`
+- Scratch/temp: `/tmp/claude-scratch/<purpose>-YYYY-MM-DD.ext`
+- Never create README unless explicitly asked.
+
+### MCP routing (pull-tier — invoke when task signal matches)
+**Design / UI:**
+- Figma URL / design ref → `figma` / `claude_ai_Figma` (`get_design_context`)
+- Design system / variants → `stitch`
+
+**Engineer / SRE:**
+- Prod error → `sentry`
+- Grafana dashboard / Prometheus query / Loki logs / OnCall / Incidents → `grafana`
+- Cloudflare Workers / D1 / R2 / KV / Hyperdrive → `claude_ai_Cloudflare_Developer_Platform`
+- Supabase ops → `supabase`
+- Stripe payment debugging → `stripe`
+
+**Manager / Planner / Writer:**
+- Linear issues → `linear`
+- Slack comms → `slack` / `claude_ai_Slack`
+- Gmail drafts/threads/labels → `claude_ai_Gmail`
+- Calendar events → `claude_ai_Google_Calendar`
+- Google Drive file access → `claude_ai_Google_Drive`
+
+**Analyst / Marketer:**
+- PostHog analytics/funnels → `posthog`
+- Grafana time-series / Prometheus → `grafana`
+
+**Security:**
+- Secrets management → `infisical`
+
+**Knowledge / Architecture:**
+- Cross-repo knowledge ("which repos use X", "patterns across products") → `memory`
+- Within-repo state → flat-file auto-memory (`~/.claude/projects/<id>/memory/`)
+
+**Rule of thumb:** core tools (Read/Edit/Write/Glob/Grep/Bash) for local ops; MCPs for external-system state. Don't use MCPs as a slow alternative to core tools.
+
+### Response discipline
+- Tight responses — match detail to task.
+- No "Let me..." / "I'll now...". Just do.
+- End-of-turn summary: 1-2 sentences.
+- Reference `file:line` when pointing to code.
+
+### Drift detection
+On first code-edit of the session, verify this preamble's VERSION tag matches `~/.claude/conventions/universal-claudemd.md` § 9. If stale, propose sync to user before proceeding.
+
+### Full detail
+- Universal laws + architecture: `~/.claude/conventions/universal-claudemd.md`
+- Doc placement + cleanup: `~/.claude/conventions/project-hygiene.md`
+- Latest audit: `~/.claude/specs/2026-04-18-plugin-surface-audit.verdicts.md`
+
 ## Products
 
 | Product | What It Does | Who Uses It | Status |
