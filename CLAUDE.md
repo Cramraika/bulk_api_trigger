@@ -8,127 +8,169 @@
 
 **Sources**: `~/.claude/conventions/universal-claudemd.md` (laws, MCP routing, lifecycle, rent rubric) + `~/.claude/conventions/project-hygiene.md` (doc placement, cleanup, local-workspaces). Read relevant sections before significant work. Re-audit due **2026-07-19**. Sync: `~/.claude/scripts/sync-preambles.py`.
 
-## Products
+## Project Scope & Vision
 
-| Product | What It Does | Who Uses It | Status |
-|---------|-------------|-------------|--------|
-| CSV-to-Webhook Engine | Reads CSV files and fires thousands of HTTP requests to arbitrary webhook/API endpoints | Operations team, developers | Live |
-| File Watchdog | Monitors a directory for new CSV files and auto-processes them without manual intervention | Automated pipelines | Live |
-| Job Resume System | Tracks progress in SQLite so interrupted jobs resume from the last successful row | Operations team | Live |
-| Adaptive Rate Limiter | Dynamically adjusts request pacing based on error rates to avoid overwhelming target APIs | Automated (internal) | Live |
-| REST Status API | Health check and job status endpoints for monitoring containers and integrating with dashboards | Monitoring systems (Uptime Kuma, Netdata) | Live |
-| Notification System | Slack and email alerts on job completion, file detection, and progress milestones | Operations team | Live |
+Production-grade CSV-driven bulk webhook/API firing engine with adaptive throttling, checkpoint/resume, and operator observability. The single-file Python app (`webhook_trigger.py`, ~191 KB) supersedes the earlier `webhook_trigger` repo by adding SQLite job tracking, filesystem watchdog auto-processing, REST status API, Slack/email notifications, file deduplication, and container-grade health checks. Public repo under Cramraika org — positioned as a reusable operations tool (sponsor CTA in README) for triggering thousands of webhooks from CSV inputs without maintaining a bespoke queue worker.
 
-## Product Details
+**Vision at pinnacle**: Self-healing webhook fan-out service that drops into any ops pipeline: operator drops CSV into a watched dir, engine validates columns, fires requests at a target API with adaptive pace, recovers from container restarts at the exact row, and surfaces progress via Slack + REST. No queue broker, no Redis, no orchestration — just the Python, SQLite, and Docker.
 
-### CSV-to-Webhook Engine
-- **User journey**: Drop a CSV file with `webhook_url` column (+ optional method, payload, header, name, group) -> Engine validates columns -> Fires requests with configurable parallelism (up to 5 workers) -> Generates JSON report with success/failure counts
-- **Success signals**: 10,000+ webhooks fired with < 1% failure rate; job reports show clean completion
-- **Failure signals**: High failure rate from misconfigured CSVs; rejected files pile up without operator awareness
+## Status & Tier
 
-### File Watchdog
-- **User journey**: Place CSV in `/app/data/csv/` -> Watchdog detects new file (3s debounce) -> Auto-queues for processing -> Processed files archived to `csv/processed/`, duplicates to `csv/duplicates/`, invalid to `csv/rejected/`
-- **Success signals**: Zero manual intervention for routine webhook jobs; new files processed within seconds
-- **Failure signals**: Watchdog misses files; queue backs up beyond 100 items; debounce too aggressive
+- **Tier**: C (Stable / Maintenance) — live, in routine use, no active feature development; accepts dependency bumps via Renovate + security fixes
+- **Deployment status**: GREEN — CI green, Docker image builds clean, production use via Coolify / local docker-compose
+- **Activity**: Dependency / CI / hygiene commits only since 2026-03 (see Past / Phase History)
+- **Public**: Yes — under Cramraika org, MIT license
 
-### Job Resume System
-- **User journey**: Job starts processing 5,000 rows -> Container restarts at row 3,200 -> Container comes back up -> Job resumes from row 3,201 automatically
-- **Success signals**: No duplicate webhook calls after restart; zero data loss on crash recovery
-- **Failure signals**: Duplicate calls sent; resume picks wrong offset; SQLite DB corrupted
+## Stack
 
-### Adaptive Rate Limiter
-- **User journey**: Engine starts at 2.0s delay between requests -> Target API starts returning 429s -> Engine detects > 30% error rate in 20-request window -> Delay ramps up toward 10.0s max -> Error rate drops -> Delay ramps back down
-- **Success signals**: Target APIs never rate-limit the engine; throughput maximized within safe bounds
-- **Failure signals**: Engine hammers a rate-limited API; delay never recovers after transient errors
-
-### REST Status API
-- **User journey**: `GET /health` returns container health -> `GET /status` returns current job progress, queue depth, and system metrics
-- **Success signals**: Uptime Kuma shows green; dashboards display accurate job progress
-- **Failure signals**: Health endpoint returns 200 but engine is stuck; status metrics are stale
-
-### Notification System
-- **User journey**: Configure Slack webhook and/or email SMTP in `config.yaml` -> Receive alerts on job completion (success/failure counts), new file detection, and progress every N items
-- **Success signals**: Operator learns about failed jobs within minutes; no alert fatigue from excessive notifications
-- **Failure signals**: Slack webhook expired silently; email alerts land in spam; progress notifications fire too frequently
-
-## Tech Reference
-
-### Stack
 - **Runtime**: Python 3.11 (single-file architecture: `webhook_trigger.py`)
-- **Database**: SQLite (job tracking, resume support, deduplication)
-- **Config**: YAML (`config.yaml`)
-- **Deployment**: Docker + docker-compose
-- **File monitoring**: watchdog library
-- **HTTP**: requests library with retry logic
-- **Tier**: C (Stable/Maintenance)
+- **HTTP**: `requests>=2.31.0`, `urllib3>=2.6.3`, `certifi>=2023.0.0`
+- **Progress / UX**: `tqdm>=4.65.0`
+- **Config**: `PyYAML>=6.0` (`config.yaml`) + `.env` env var overrides
+- **Filesystem monitoring**: `watchdog>=3.0.0`
+- **Date handling**: `python-dateutil>=2.8.0`, `idna>=3.4`, `charset-normalizer>=3.0.0`
+- **Observability**: `sentry-sdk>=2.18.0` (wired to GlitchTip via DSN)
+- **Database**: SQLite (stdlib) — job history, per-request tracking, resume markers, file dedup
+- **Packaging / Deploy**: Docker (`python:3.11-slim`) + docker-compose; health check on `:8000/health`
+- **CI**: GitHub Actions — lint (flake8 E9,F63,F7), security audit (pip-audit), Docker build
+- **Security**: CodeQL (Python, `security-and-quality` queries, weekly + on PR)
+- **Dependency automation**: Renovate (self-hosted via GitHub Actions, weekly Sun 22:00 UTC)
 
-### File Organization
-- Never save working files to root folder
-- `webhook_trigger.py` - Main application (single-file architecture)
-- `config.yaml` - Application configuration (watchdog, rate limiting, retry, notifications, database, CSV settings)
-- `Dockerfile` / `docker-compose.yml` - Container deployment
-- `data/` - Runtime data (CSV files, logs, reports, backups, SQLite DB)
+## Build / Test / Deploy
 
-### Build & Test
 ```bash
-# Docker deployment (recommended)
-docker-compose up -d                              # Start container
-docker-compose logs -f bulk-api-trigger            # View logs
+# Docker (recommended)
+docker-compose up -d                              # Build + start
+docker-compose logs -f bulk-api-trigger            # Tail logs
+docker-compose down                                # Stop
 
-# Local development
+# Local dev
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python webhook_trigger.py --create-config          # Generate default config
-python webhook_trigger.py --interactive            # Interactive mode
-python webhook_trigger.py file.csv --dry-run       # Dry run to validate
+python webhook_trigger.py --create-config          # Generate default config.yaml
+python webhook_trigger.py --interactive            # Guided setup
+python webhook_trigger.py file.csv --dry-run       # Validate without firing
+python webhook_trigger.py file.csv --workers 10 --rate-limit 1.0
+
+# Lint (matches CI)
+flake8 *.py --max-line-length=120 --select=E9,F63,F7
+
+# Security audit (matches CI)
+pip-audit --desc
 
 # Health check
 curl http://localhost:8000/health
 curl http://localhost:8000/status
 ```
 
-### Environment Variables
-- See `config.yaml` for full configuration reference
-- `WEBHOOK_AUTH_TOKEN` - Bearer token for API authentication
-- `SLACK_WEBHOOK_URL` - Slack notification webhook
-- `DATABASE_PATH` - SQLite database path (default: `/app/data/webhook_results.db`)
+**Deployment**: Coolify app (Dockerfile build pack) or docker-compose directly on a VPS. Container keeps itself alive with `KEEP_ALIVE=true` + watchdog loop. `Procfile` retained for Railway compatibility (legacy; not primary path).
 
-### n8n Workflow Automation
+## Key Directories
 
-This project can trigger and receive n8n workflows at `https://n8n.chinmayramraika.in`.
+| Path | Purpose |
+|---|---|
+| `webhook_trigger.py` | Monolithic app — rate limiter, HTTP client, watchdog, REST API, SQLite, notifications |
+| `config.yaml` | Default runtime config (watchdog, rate limit, retry, notifications, DB, CSV) |
+| `.env.example` | Env var reference — 60+ tunables (rate limit, CSV paths, DB, notifications, n8n) |
+| `Dockerfile` | `python:3.11-slim` base, creates `/app/data/{csv,reports,logs,backups}` tree |
+| `docker-compose.yml` | Single-service stack, port 8000, volume-mounts `./data` and `config.yaml:ro` |
+| `Procfile` | Railway legacy deploy hint (not primary) |
+| `requirements.txt` | 10 pinned direct deps |
+| `renovate.json` | Weekly dependency update config |
+| `.github/workflows/` | `ci.yml` (lint + pip-audit + Docker build), `codeql.yml` (SAST), `renovate.yml` |
+| `docs/ENVIRONMENTS.md` | Deployment environment reference (local / Docker / env vars / REST API) |
+| `data/` | Runtime data root — `csv/{processed,duplicates,rejected}`, `reports/`, `logs/`, `backups/`, `webhook_results.db` (gitignored) |
+| `SECURITY.md` | Security policy + reporting contact |
+| `LICENSE` | MIT |
 
-- **Webhook URL:** Set in `N8N_WEBHOOK_URL` env var
-- **API Key:** Set in `N8N_API_KEY` env var (unique per project)
-- **Auth Header:** `X-API-Key: <N8N_API_KEY>`
-- **Workflow repo:** github.com/Cramraika/n8n-workflows (private)
+**Never save working files to the repo root.** Scratch goes to `/tmp/claude-scratch/` per `project-hygiene.md`.
 
-## VPS Services Integration
+## External Services
 
-This repo is wired into the following VPS services:
+### Runtime integrations
+- **Target webhooks / APIs** — whatever URLs land in the CSV `webhook_url` column (LeadSquared, Slack webhooks, n8n workflows, bespoke internal APIs)
+- **Slack incoming webhook** (optional) — configured per-deploy via `SLACK_WEBHOOK_URL`. Notifies on completion, new-file detection, and progress milestones
+- **SMTP server** (optional) — Gmail-compatible SMTP for email alerts; app password required
+- **n8n** (`n8n.chinmayramraika.in`) — can trigger / receive workflows. Env: `N8N_WEBHOOK_URL`, `N8N_API_KEY` (unique per project). Workflow defs in private `github.com/Cramraika/n8n-workflows`
 
-### Observability
-- **GlitchTip** (errors.chinmayramraika.in): Project `bulk-api`, DSN in Infisical (no dedicated workspace — use Coolify env vars)
-- **Loki** (grafana.chinmayramraika.in → Explore): Logs auto-collected via Promtail Docker SD
-- **Grafana** (grafana.chinmayramraika.in): Dashboards for container logs, error rate, infrastructure
-- **Uptime Kuma** (status.chinmayramraika.in): No dedicated monitor yet (add one for `/health` endpoint)
-- **Netdata** (monitor.chinmayramraika.in): System metrics + custom alarms
+### MCPs (per universal-claudemd.md §6)
+- `sentry` (local) — GlitchTip DSN surfaced via Sentry SDK; errors land in `errors.chinmayramraika.in`
+- `slack` (local + claude.ai) — for ops comms / deploy channel posts
+- `grafana` (claude.ai) — Loki logs (via Promtail Docker SD) + container metrics dashboards
+- `infisical` (claude.ai) — secret management (pending dedicated workspace; currently Coolify env vars)
+- **Disabled for this repo** (no UI): `figma` — per universal §6 session-aware disable guidance
+
+## Observability
+
+- **GlitchTip** (`errors.chinmayramraika.in`) — project `bulk-api`, DSN delivered via Coolify env var. Initialized in the app via `sentry-sdk` on startup.
+- **Loki** (`grafana.chinmayramraika.in` → Explore) — container stdout/stderr collected by Promtail Docker SD; filter by `container_name=bulk-api-trigger`.
+- **Grafana** (`grafana.chinmayramraika.in`) — infrastructure / error-rate / container dashboards.
+- **Uptime Kuma** (`status.chinmayramraika.in`) — **no dedicated monitor yet** (Roadmap item: add `/health` HTTP monitor).
+- **Netdata** (`monitor.chinmayramraika.in`) — system-level Docker / host metrics.
+- **Internal endpoints**: `/health`, `/status`, `/metrics`, `/jobs`, `/jobs/{id}`, `/jobs/{id}/errors`, `/resume/stats` (see `docs/ENVIRONMENTS.md` full REST table).
 
 ### Notifications
 - **Slack**: Deploys → #deploys, Errors → #errors, CI → #ci, Kuma alerts → #cron
-- **Telegram**: Critical alerts → @vpsmgr_bot (chat 710228663)
+- **Telegram**: Critical alerts → `@vpsmgr_bot` (chat 710228663)
 - **Email**: Netdata + Uptime Kuma → chinu.ramraika@gmail.com
 
-### Secrets
-- **Infisical** (secrets.chinmayramraika.in): No dedicated workspace yet. Secrets managed via Coolify env vars.
-- When Infisical workspace is created: Delivery via Agent on VPS → env file → docker-compose env_file mount.
+## Dependency Graph
 
-### Staging
-- Not yet configured. When ready:
-- URL: `https://staging-bulk.chinmayramraika.in`
-- Branch: `staging`
-- Deploy: Coolify clone / docker-compose.staging.yml
+**Upstream (what this depends on)**
+- Python 3.11 runtime (containerized)
+- Target webhook APIs (external — LeadSquared, Slack, n8n, etc.)
+- SQLite (embedded, no external DB server)
+- Coolify / docker-compose host (deployment)
+- n8n (optional workflow hook)
 
-### Security Rules
-- NEVER hardcode API keys, secrets, or credentials in any file
-- NEVER pass credentials as inline env vars in Bash commands
-- NEVER commit .env, .claude/settings.local.json, or .mcp.json to git
-- Always validate user input at system boundaries
+**Downstream (what depends on this)**
+- Ops workflows at Coding Ninjas (webhook bulk-fires)
+- Any ad-hoc migration / notification campaign using CSV-driven HTTP triggers
+- External users of the public repo (sponsor-facing)
+
+**Supersession / relation**
+- **Supersedes `webhook_trigger`** (`~/Documents/Github/webhook_trigger/`) — earlier single-file script, same CSV-driven webhook idea. `webhook_trigger` is retained as the "lite" reference implementation (no SQLite, no watchdog, no REST, no adaptive rate, no resume). New work and deployments use `bulk_api_trigger`. `webhook_trigger` remains Tier C for historical reference and tiny one-shot jobs where the heavier deployment isn't worth it.
+- **Peer**: `tldv_downloader` — different domain (meeting downloads) but same single-file Python + Tier C posture.
+
+## Roadmap / Future
+
+1. **Uptime Kuma monitor** — add `/health` monitor on `status.chinmayramraika.in` so outages surface via Slack/Telegram alert paths already wired (Observability above).
+2. **Infisical workspace** — create `bulk-api-trigger` workspace; switch from Coolify env vars to Infisical Agent → env file → docker-compose `env_file` mount. Blocker: general Infisical rollout cadence across the fleet.
+3. **Staging environment** — not yet configured. Planned: `staging-bulk.chinmayramraika.in`, `staging` branch, Coolify clone or `docker-compose.staging.yml`. Low priority while the app is stable.
+4. **Dashboard surface** — `docker-compose.yml` has a commented-out `dashboard` nginx service. Defer unless operator need emerges (status API + Grafana currently suffice).
+5. **Adapter shelves (per README sponsor CTA)** — potential packaged adapters for Salesforce, HubSpot, LeadSquared (structured envelopes + auth helpers) if sponsor demand materializes. Not currently scoped.
+6. **Single-file refactor audit** — `webhook_trigger.py` is ~191 KB in one module. Splitting into `core/`, `api/`, `notifications/`, `watchdog/` submodules deferred until a concrete maintenance pain emerges (readability vs. diff-stability trade).
+
+## Past / Phase History
+
+- **2026-04-19** — Preamble synced to v8 (this pass).
+- **2026-04-13 → 2026-04-18** — Repo hygiene wave: added CODEOWNERS, PR template, issue templates, SECURITY.md, CodeQL workflow, Dependabot, Renovate. Then pinned `renovatebot/github-action@v46.1.8`. CLAUDE.md preamble cadence: v3 → v4 (re-audit status) → v5 (dynamic maintenance) → v6 (stability/resilience) → v7 (full template-rules catalog) → v7 compact → v8.
+- **2026-04-12** — Wired Sentry / GlitchTip SDK for bulk webhook worker. Added `.dockerignore` + Claude settings. Snyk PRs merged for dependency CVEs. Renovate GitHub Action enabled.
+- **2026-03 → 2026-04-12** — Dependabot-driven dependency bumps (setup-python 5→6, codeql-action 3→4, buildx-action 3→4, build-push-action 5→7). VPS Services Integration block added to CLAUDE.md. n8n workflow automation note added.
+- **Pre-2026-03** — Single-file app consolidated; Docker + docker-compose deployment settled. Adaptive rate limiter + SQLite job tracking + REST status API + watchdog auto-processing landed together (README calls this v2.0). GitHub Sponsors CTA added.
+- **Supersession from `webhook_trigger`** — key lift from lite version: SQLite history, REST API, watchdog, resume, adaptive rate, notifications.
+
+## Known Limitations
+
+- **Single-file app** — `webhook_trigger.py` ~191 KB mixes concerns (rate limiter, HTTP, REST, watchdog, SQLite, notifications). Readable, but greenfield contributors need to navigate carefully.
+- **Single-threaded rate limiter** — adaptive pacing uses a single `RateLimiter` instance; at very high `MAX_WORKERS` values it can be the bottleneck before the target API is.
+- **No native queue backend** — works for "fire CSV → hundreds/low-thousands of requests". For jobs in the 100K+ range a real queue (Redis/Celery) would outperform SQLite checkpointing.
+- **No staging env** — all production changes land on main → Coolify; rely on Docker local `--dry-run` + dry-run flag for validation.
+- **No Uptime Kuma monitor yet** — outages only surface via GlitchTip / Loki / manual `curl /health`.
+- **Infisical workspace pending** — secrets still managed via Coolify env vars.
+- **File dedup via SHA hash only** — renaming a file after processing defeats dedup; operator must clean `processed/` periodically if rerunning historical batches.
+- **Resume max-age 7 days default** — interrupted jobs older than a week are silently ignored on next run (per `RESUME_MAX_AGE_DAYS`).
+
+## Doc Maintainers
+
+- **Primary**: Chinmay (`chinu.ramraika@gmail.com`) — code + deployment + docs.
+- **Auto-updated by Claude**: stack table, build commands, env var reference, VPS wiring (must match reality of `config.yaml` + `.env.example` + `docker-compose.yml`).
+- **Frozen unless user asks**: README marketing copy + sponsor CTA (user owns positioning). Living per `project-hygiene.md` — Claude may update feature/config sections to track code, but preserve the marketing framing.
+
+## Deviations from Universal Laws
+
+None known. All universal-claudemd.md laws and project-hygiene.md conventions apply as-is:
+
+- Single-file app is an accepted pattern for this domain (Tier C, stable, low change velocity) — not a deviation, just a concentration of code in one module.
+- README is **living** per `project-hygiene.md` § README curation (public CLI tool → README is the user manual).
+- Preamble is compact form per universal-claudemd.md § 9; no inline expansion.
