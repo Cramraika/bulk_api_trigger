@@ -1,17 +1,31 @@
-# 🚀 Enhanced Bulk API Trigger Platform v2.0
+# 🚀 bulk — webhook/API trigger platform
 
 > **Fire thousands of webhooks/APIs from a CSV — with resume, rate-limiting, and real-time monitoring.**
 
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/Cramraika?logo=github&label=Sponsor)](https://github.com/sponsors/Cramraika)
-[![Stars](https://img.shields.io/github/stars/Cramraika/bulk_api_trigger?style=social)](https://github.com/Cramraika/bulk_api_trigger/stargazers)
+[![Buy Me a Coffee](https://img.shields.io/badge/buy%20me%20a%20coffee-vagarylife-yellow?logo=buymeacoffee)](https://buymeacoffee.com/vagarylife)
+[![Stars](https://img.shields.io/github/stars/Cramraika/bulk?style=social)](https://github.com/Cramraika/bulk/stargazers)
 [![Docker](https://img.shields.io/badge/docker-ready-blue?logo=docker)](./Dockerfile)
-[![License](https://img.shields.io/github/license/Cramraika/bulk_api_trigger)](./LICENSE)
+[![License: MIT](https://img.shields.io/github/license/Cramraika/bulk)](./LICENSE)
 
 Production-ready platform for triggering thousands of webhooks/APIs with advanced features including REST API endpoints, resume support, file watchdog, auto-processing, comprehensive notifications, and real-time monitoring.
 
+> **Heads-up:** this repo was previously named `bulk_api_trigger`. GitHub auto-redirects old URLs, but please update your remotes (`git remote set-url origin https://github.com/Cramraika/bulk.git`).
+
 ## 💖 Sponsor this project
 
-If this platform powers your operations, [sponsor on GitHub](https://github.com/sponsors/Cramraika) — your support keeps it maintained and funds new adapters (Salesforce, HubSpot, LeadSquared). Or [reach out](https://chinmayramraika.in) about enterprise deployment and custom integrations.
+If this platform powers your operations, please consider sponsoring — your support keeps it maintained and funds new adapters (Salesforce, HubSpot, LeadSquared):
+
+- 💛 **[GitHub Sponsors](https://github.com/sponsors/Cramraika)** (monthly + one-time)
+- ☕ **[Buy Me a Coffee](https://buymeacoffee.com/vagarylife)** (one-time)
+- 🌐 **[Personal site](https://chinmayramraika.in)** for enterprise deployment and custom integrations
+
+## 🔁 Upstream / where this engine lives
+
+`bulk` is the standalone OSS distribution of an engine that has also been absorbed upstream into the [vagary-platform](https://github.com/Cramraika/vagary-platform) monorepo as `backend/framework/notifications/fanout/`. The upstream version powers vertical applications (news alerts, budget bills, etc.). Both versions are MIT-licensed; pick whichever fits your deployment shape:
+
+- **Use `bulk`** if you want a self-contained webhook/API blaster with CSV ingestion, file watching, and a REST API.
+- **Use `vagary-platform/backend/framework/notifications/fanout`** if you're already on FastAPI + MongoDB and want a Protocol-based fanout engine you can wire into your services.
 
 ## ✨ Key Features
 
@@ -40,21 +54,21 @@ If this platform powers your operations, [sponsor on GitHub](https://github.com/
 
 ```bash
 # Clone repository
-git clone <your-repo-url>
-cd bulk-api-trigger
+git clone https://github.com/Cramraika/bulk.git
+cd bulk
 
 # Create directory structure
 mkdir -p data/{csv/{processed,duplicates,rejected},reports,logs,backups}
 
 # Configure environment
-cp .env.sample .env
+cp .env.example .env
 # Edit .env with your settings
 
 # Start with Docker Compose
 docker-compose up -d
 
 # Check logs
-docker-compose logs -f bulk-api-trigger
+docker-compose logs -f bulk
 ```
 
 ### Local Development
@@ -254,9 +268,9 @@ The platform automatically saves progress checkpoints during processing:
 ```yaml
 version: '3.8'
 services:
-  bulk-api-trigger:
+  bulk:
     build: .
-    container_name: bulk-api-trigger
+    container_name: bulk
     restart: unless-stopped
     env_file: .env
     volumes:
@@ -276,14 +290,14 @@ services:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: bulk-api-trigger
+  name: bulk
 spec:
   replicas: 1
   template:
     spec:
       containers:
-      - name: bulk-api-trigger
-        image: your-registry/bulk-api-trigger:latest
+      - name: bulk
+        image: your-registry/bulk:latest
         ports:
         - containerPort: 8000
         livenessProbe:
@@ -400,7 +414,12 @@ BASE_RATE_LIMIT=1.0
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development setup, PR workflow, and code-style guidelines. For security issues, see [SECURITY.md](./SECURITY.md) (please don't file public issues for vulnerabilities).
 
+## 📜 License
 
-Built with ❤️ for reliable webhook processing at scale
+[MIT](./LICENSE) © Chinmay Ramraika
+
+---
+
+Built with ❤️ for reliable webhook processing at scale.
