@@ -1,6 +1,6 @@
 # Environments - Bulk API Trigger
 
-**Repo**: Cramraika/bulk_api_trigger
+**Repo**: Cramraika/bulk
 **Stack**: Python 3.11 + Docker + SQLite + YAML config
 
 ---
@@ -16,8 +16,8 @@
 ### Installation
 
 ```bash
-git clone https://github.com/Cramraika/bulk_api_trigger.git
-cd bulk_api_trigger
+git clone https://github.com/Cramraika/bulk.git
+cd bulk
 
 # Create virtual environment (recommended)
 python -m venv venv

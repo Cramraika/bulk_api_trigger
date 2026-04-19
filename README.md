@@ -3,9 +3,9 @@
 > **Fire thousands of webhooks/APIs from a CSV — with resume, rate-limiting, and real-time monitoring.**
 
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/Cramraika?logo=github&label=Sponsor)](https://github.com/sponsors/Cramraika)
-[![Stars](https://img.shields.io/github/stars/Cramraika/bulk_api_trigger?style=social)](https://github.com/Cramraika/bulk_api_trigger/stargazers)
+[![Stars](https://img.shields.io/github/stars/Cramraika/bulk?style=social)](https://github.com/Cramraika/bulk/stargazers)
 [![Docker](https://img.shields.io/badge/docker-ready-blue?logo=docker)](./Dockerfile)
-[![License](https://img.shields.io/github/license/Cramraika/bulk_api_trigger)](./LICENSE)
+[![License](https://img.shields.io/github/license/Cramraika/bulk)](./LICENSE)
 
 Production-ready platform for triggering thousands of webhooks/APIs with advanced features including REST API endpoints, resume support, file watchdog, auto-processing, comprehensive notifications, and real-time monitoring.
 
