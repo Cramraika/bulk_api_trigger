@@ -1,4 +1,4 @@
-# Bulk API Trigger
+# Bulk (formerly Bulk API Trigger)
 
 ## Claude Preamble
 <!-- VERSION: 2026-04-19-v9 -->
@@ -10,7 +10,7 @@
 
 ## Project Scope & Vision
 
-Production-grade CSV-driven bulk webhook/API firing engine with adaptive throttling, checkpoint/resume, and operator observability. The single-file Python app (`webhook_trigger.py`, ~191 KB) supersedes the earlier `webhook_trigger` repo by adding SQLite job tracking, filesystem watchdog auto-processing, REST status API, Slack/email notifications, file deduplication, and container-grade health checks. Public repo under Cramraika org — positioned as a reusable operations tool (sponsor CTA in README) for triggering thousands of webhooks from CSV inputs without maintaining a bespoke queue worker.
+Production-grade CSV-driven bulk webhook/API firing engine with adaptive throttling, checkpoint/resume, and operator observability. The single-file Python app (`webhook_trigger.py`, ~191 KB) supersedes the earlier `webhook_trigger` repo (archived on GitHub 2026-04-19) by adding SQLite job tracking, filesystem watchdog auto-processing, REST status API, Slack/email notifications, file deduplication, and container-grade health checks. Public repo under Cramraika org (renamed from `bulk_api_trigger` to `bulk` 2026-04-19) — positioned as a reusable operations tool (sponsor CTA in README) for triggering thousands of webhooks from CSV inputs without maintaining a bespoke queue worker.
 
 **Vision at pinnacle**: Self-healing webhook fan-out service that drops into any ops pipeline: operator drops CSV into a watched dir, engine validates columns, fires requests at a target API with adaptive pace, recovers from container restarts at the exact row, and surfaces progress via Slack + REST. No queue broker, no Redis, no orchestration — just the Python, SQLite, and Docker.
 
@@ -129,7 +129,7 @@ curl http://localhost:8000/status
 - External users of the public repo (sponsor-facing)
 
 **Supersession / relation**
-- **Supersedes `webhook_trigger`** (`~/Documents/Github/webhook_trigger/`) — earlier single-file script, same CSV-driven webhook idea. `webhook_trigger` is retained as the "lite" reference implementation (no SQLite, no watchdog, no REST, no adaptive rate, no resume). New work and deployments use `bulk_api_trigger`. `webhook_trigger` remains Tier C for historical reference and tiny one-shot jobs where the heavier deployment isn't worth it.
+- **Supersedes `webhook_trigger`** (`~/Documents/Github/webhook_trigger/` — archived on GitHub 2026-04-19) — earlier single-file script, same CSV-driven webhook idea. `webhook_trigger` local dir is retained as the "lite" reference implementation (no SQLite, no watchdog, no REST, no adaptive rate, no resume). All new work and deployments use this repo (`bulk`, renamed from `bulk_api_trigger` 2026-04-19).
 - **Peer**: `tldv_downloader` — different domain (meeting downloads) but same single-file Python + Tier C posture.
 
 ## Roadmap / Future
@@ -139,7 +139,8 @@ curl http://localhost:8000/status
 3. **Staging environment** — not yet configured. Planned: `staging-bulk.chinmayramraika.in`, `staging` branch, Coolify clone or `docker-compose.staging.yml`. Low priority while the app is stable.
 4. **Dashboard surface** — `docker-compose.yml` has a commented-out `dashboard` nginx service. Defer unless operator need emerges (status API + Grafana currently suffice).
 5. **Adapter shelves (per README sponsor CTA)** — potential packaged adapters for Salesforce, HubSpot, LeadSquared (structured envelopes + auth helpers) if sponsor demand materializes. Not currently scoped.
-6. **Single-file refactor audit** — `webhook_trigger.py` is ~191 KB in one module. Splitting into `core/`, `api/`, `notifications/`, `watchdog/` submodules deferred until a concrete maintenance pain emerges (readability vs. diff-stability trade).
+6. **Single-file refactor audit** — application file (`webhook_trigger.py` — filename retained for internal-API stability) is ~191 KB in one module. Splitting into `core/`, `api/`, `notifications/`, `watchdog/` submodules deferred until a concrete maintenance pain emerges (readability vs. diff-stability trade).
+7. **Repo file rename pending** — consider renaming the application file from `webhook_trigger.py` to `bulk.py` to match the repo rename. Blocker: breaking change for any operator with scripts invoking the file by name. Defer to next major version bump.
 
 ## Past / Phase History
 
