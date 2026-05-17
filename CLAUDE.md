@@ -236,3 +236,15 @@ Mail | DNS | RP | Orch | Obs | Backup | Sup | Sec | Tun | Err | Wflw | Spec
 4. Cluster 4 observability hardening flagged Phase 9.2.
 5. Renamed-from-webhook_trigger trajectory cited (archived 2026-04-19).
 6. Absorption trajectory by vagary-platform noted (A1 refactor done; standalone keeps running).
+
+---
+
+## VPS Service Navigation
+
+`bulk` is **DECOMMISSIONED** (no Coolify app — verified ENTRY #316 Coolify-DB query; notifications-fanout absorbed by `vagary-platform`). It currently consumes no live dual-VPS service. This stub is retained so a future revival session has the navigation pattern; canonical service playbooks live in `platform-docs/02-governance/service-playbooks/`.
+
+| Service | State | If revived |
+|---|---|---|
+| **Infisical** (secrets) | No active project — `bulk` is OSS; credentials are downstream-user-supplied (W12: nothing to onboard) | Create a `bulk` Infisical project per `service-playbooks/substrate/infisical.md` §6 wiring guide + §9.5 |
+| **Coolify** (orchestration) | Decommissioned — no app row in Coolify-DB | Register via Coolify API per `service-playbooks/substrate/coolify.md` §5 |
+| **Observability** | n/a — no running deployment | `service-playbooks/observability/*.md` |
