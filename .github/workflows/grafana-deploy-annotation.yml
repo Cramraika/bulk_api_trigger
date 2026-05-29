@@ -1,0 +1,114 @@
+# Grafana deploy-annotation webhook (fleet fanout from host_page canary)
+#
+# WHY THIS WORKFLOW EXISTS
+# ------------------------
+# After each production deploy of bulk, this workflow POSTs a deploy
+# annotation to Grafana so panels that display incident/error spikes can
+# correlate them with the exact deploy commit. Annotation tags carry the repo
+# name + the literal "deploy" string + the short commit SHA, so Grafana panel
+# filters such as `tags=["deploy","bulk"]` light up the timeline.
+#
+# TRIGGER NOTE (differs from the host_page canary)
+# ------------------------------------------------
+# The canary used `workflow_run: ["coolify-deploy"]`. That does NOT generalize:
+# this repo deploys via Coolify's GitHub-App webhook, which fires on `push` to
+# main and produces NO GitHub Actions `workflow_run` event. The correct
+# deploy-representative trigger for a Coolify-webhook repo is therefore
+# `push: branches: [main]` — every push to main IS a deploy here.
+#
+# Authentication: `GRAFANA_DEPLOY_ANNOTATION_TOKEN` is a repo-level GitHub
+# Actions secret holding the shared Grafana Editor-scoped service-account token
+# (instance-wide annotation create). Stored canonically in Infisical as
+# `HOST_PAGE_GRAFANA_DEPLOY_ANNOTATION_TOKEN`.
+#
+# Per `~/.claude/conventions/playbooks/deployed-service.md`, this fits the
+# time-window correlation cascade (sentry -> grafana -> deployments).
+
+name: grafana-deploy-annotation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Commit SHA to annotate (defaults to current HEAD)"
+        required: false
+        type: string
+      annotation_text:
+        description: "Optional annotation text"
+        required: false
+        type: string
+
+concurrency:
+  group: grafana-deploy-annotation-bulk
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  annotate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Resolve commit SHA + short SHA
+        id: sha
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.commit_sha }}" ]; then
+            FULL_SHA="${{ inputs.commit_sha }}"
+          else
+            FULL_SHA="${{ github.sha }}"
+          fi
+          SHORT_SHA="${FULL_SHA:0:7}"
+          echo "full=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve annotation time (ms epoch, UTC)
+        id: time
+        run: |
+          # Deploy time is "now" (the push that triggered this run).
+          # Grafana expects ms-since-epoch.
+          set -euo pipefail
+          echo "ms=$(( $(date +%s) * 1000 ))" >> "$GITHUB_OUTPUT"
+
+      - name: POST annotation to Grafana
+        env:
+          GRAFANA_URL: https://grafana.chinmayramraika.in
+          GRAFANA_TOKEN: ${{ secrets.GRAFANA_DEPLOY_ANNOTATION_TOKEN }}
+          FULL_SHA: ${{ steps.sha.outputs.full }}
+          SHORT_SHA: ${{ steps.sha.outputs.short }}
+          TIME_MS: ${{ steps.time.outputs.ms }}
+          DISPATCH_TEXT: ${{ inputs.annotation_text }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GRAFANA_TOKEN:-}" ]; then
+            echo "::error::GRAFANA_DEPLOY_ANNOTATION_TOKEN secret is not set."
+            exit 1
+          fi
+          TEXT="${DISPATCH_TEXT:-Deploy bulk @ ${SHORT_SHA}}"
+          BODY=$(jq -n \
+            --arg text "$TEXT" \
+            --argjson time "$TIME_MS" \
+            --arg repo "bulk" \
+            --arg sha "$SHORT_SHA" \
+            '{tags:["deploy",$repo,$sha],text:$text,time:$time}')
+          # POST + capture HTTP status + body separately. Token is passed via
+          # env var; we DO NOT use `-v` to avoid header leakage.
+          HTTP=$(curl -sS \
+            -o /tmp/anno.json \
+            -w '%{http_code}' \
+            -H "Authorization: Bearer ${GRAFANA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -X POST "${GRAFANA_URL}/api/annotations" \
+            -d "$BODY")
+          echo "Grafana annotation HTTP: $HTTP"
+          # Grafana annotation endpoint does NOT echo the token back, so this is
+          # safe to log for the operator.
+          cat /tmp/anno.json
+          echo
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::Grafana annotation rejected (HTTP $HTTP)"
+            exit 1
+          fi
